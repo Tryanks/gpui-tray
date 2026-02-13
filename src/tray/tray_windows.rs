@@ -35,7 +35,6 @@ use windows_sys::Win32::{
 const TRAY_CALLBACK_MESSAGE: u32 = WM_USER + 1;
 const WM_TRAY_OPEN_MENU: u32 = WM_USER + 2;
 
-
 #[derive(Clone)]
 struct Handler {
     async_app: AsyncApp,

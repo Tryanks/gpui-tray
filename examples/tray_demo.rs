@@ -1,6 +1,6 @@
 use gpui::{
-    App, Application, Context, Div, Global, QuitMode, SharedString, Stateful, Window,
-    WindowOptions, actions, div, prelude::*, Menu, MenuItem,
+    App, Application, Context, Div, Global, Menu, MenuItem, QuitMode, SharedString, Stateful,
+    Window, WindowOptions, actions, div, prelude::*,
 };
 use gpui_tray::{TrayEvent, TrayIcon, TrayItem, TrayMenuItem};
 
