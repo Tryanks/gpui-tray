@@ -22,7 +22,9 @@ pub enum TrayToggleType {
 /// Item used to describe a tray context menu.
 #[derive(Clone, Debug)]
 pub enum TrayMenuItem {
-    Separator { label: Option<String> },
+    Separator {
+        label: Option<String>,
+    },
     Submenu {
         id: String,
         label: String,
@@ -42,7 +44,11 @@ impl TrayMenuItem {
         }
     }
 
-    pub fn menu(id: impl Into<String>, label: impl Into<String>, children: Vec<TrayMenuItem>) -> Self {
+    pub fn menu(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        children: Vec<TrayMenuItem>,
+    ) -> Self {
         Self::Submenu {
             id: id.into(),
             label: label.into(),
@@ -137,10 +143,7 @@ impl TrayItem {
         self
     }
 
-    pub fn on_event(
-        mut self,
-        event: impl FnMut(TrayEvent, &mut App) + Send + 'static,
-    ) -> Self {
+    pub fn on_event(mut self, event: impl FnMut(TrayEvent, &mut App) + Send + 'static) -> Self {
         self.event = Some(Box::new(event));
         self
     }
@@ -194,4 +197,3 @@ pub fn sync_tray(cx: &mut App, item: TrayItem) -> anyhow::Result<()> {
 pub fn sync_tray(_cx: &mut App, _item: TrayItem) -> anyhow::Result<()> {
     Ok(())
 }
-

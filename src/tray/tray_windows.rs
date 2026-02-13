@@ -15,15 +15,15 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Shell::{
-            NOTIFYICONDATAW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-            NIM_SETVERSION, NOTIFYICON_VERSION_4, Shell_NotifyIconW,
+            NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
+            NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
         },
         WindowsAndMessaging::{
-            AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-            DestroyWindow, GetCursorPos, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage,
-            RegisterClassW, SetForegroundWindow, TrackPopupMenu, CREATESTRUCTW, CW_USEDEFAULT,
-            HMENU, IDC_ARROW, IDI_APPLICATION, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING,
-            MF_UNCHECKED, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, WM_APP, WM_COMMAND,
+            AppendMenuW, CREATESTRUCTW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW,
+            DefWindowProcW, DestroyMenu, DestroyWindow, GetCursorPos, HMENU, IDC_ARROW,
+            IDI_APPLICATION, LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING,
+            MF_UNCHECKED, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
+            TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TrackPopupMenu, WM_APP, WM_COMMAND,
             WM_CREATE, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
         },
     },
@@ -97,7 +97,8 @@ fn to_wide_null(text: impl AsRef<OsStr>) -> Vec<u16> {
 
 fn class_name() -> &'static [u16] {
     static NAME: OnceLock<Vec<u16>> = OnceLock::new();
-    NAME.get_or_init(|| to_wide_null("GpuiTrayHiddenWindow")).as_slice()
+    NAME.get_or_init(|| to_wide_null("GpuiTrayHiddenWindow"))
+        .as_slice()
 }
 
 unsafe fn tray_from_window(hwnd: HWND) -> Option<&'static mut Tray> {
@@ -453,4 +454,3 @@ pub fn sync_tray(cx: &mut gpui::App, item: TrayItem) -> Result<()> {
         unsafe { tray.sync(item) }
     })
 }
-

@@ -121,8 +121,8 @@ impl LinuxTray {
                         let id = id.clone();
                         match toggle_type {
                             Some(TrayToggleType::Checkbox(checked))
-                            | Some(TrayToggleType::Radio(checked)) => vec![KsniMenuItem::from(
-                                CheckmarkItem {
+                            | Some(TrayToggleType::Radio(checked)) => {
+                                vec![KsniMenuItem::from(CheckmarkItem {
                                     label: label.clone(),
                                     checked: *checked,
                                     activate: Box::new(move |this| {
@@ -130,8 +130,8 @@ impl LinuxTray {
                                             .dispatch(TrayEvent::MenuClick { id: id.clone() })
                                     }),
                                     ..Default::default()
-                                },
-                            )],
+                                })]
+                            }
                             None => vec![KsniMenuItem::from(StandardItem {
                                 label: label.clone(),
                                 activate: Box::new(move |this| {
@@ -176,8 +176,7 @@ impl Tray for LinuxTray {
         } else {
             Point { x: 0, y: delta }
         };
-        self.handler
-            .dispatch(TrayEvent::Scroll { scroll_detal });
+        self.handler.dispatch(TrayEvent::Scroll { scroll_detal });
     }
 
     fn id(&self) -> String {
@@ -226,7 +225,10 @@ pub fn set_up_tray(_cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem)
     }
 
     let callback = std::sync::Arc::new(std::sync::Mutex::new(item.event.take()));
-    let handler = Handler { async_app, callback };
+    let handler = Handler {
+        async_app,
+        callback,
+    };
     let tray = LinuxTray::from_item(handler, item);
 
     let service = TrayService::new(tray);

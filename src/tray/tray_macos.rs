@@ -2,20 +2,15 @@
 
 use crate::tray::{TrayEvent, TrayItem, TrayMenuItem, TrayToggleType};
 use anyhow::{Context as _, Result};
-use cocoa::{
-    appkit::{NSMenu, NSMenuItem, NSStatusBar, NSVariableStatusItemLength},
-    base::{id, nil},
-    foundation::{NSData, NSAutoreleasePool, NSSize, NSString},
-};
 use gpui::AsyncApp;
-use objc::{
-    class,
-    declare::ClassDecl,
-    msg_send,
-    runtime::{Class, Object, Sel},
-    sel,
-    sel_impl,
+use objc2::rc::{Retained, autoreleasepool};
+use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, NSObject, Sel};
+use objc2::{AnyThread, ClassType, MainThreadMarker, MainThreadOnly, msg_send, sel};
+use objc2_app_kit::{
+    NSCellImagePosition, NSControlStateValueOff, NSControlStateValueOn, NSImage, NSMenu,
+    NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
+use objc2_foundation::{NSData, NSSize, NSString};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -25,21 +20,12 @@ use std::{
 
 const APP_ICON_PNG: &[u8] = include_bytes!("../image/app-icon.png");
 
-#[allow(dead_code)]
-#[repr(i64)]
-enum CellImagePosition {
-    ImageOnly = 1,
-    ImageLeft = 2,
-    ImageRight = 3,
+fn with_pool<T>(f: impl FnOnce() -> T) -> T {
+    autoreleasepool(|_| f())
 }
 
-fn with_pool<T>(f: impl FnOnce() -> T) -> T {
-    unsafe {
-        let pool = NSAutoreleasePool::new(nil);
-        let result = f();
-        let _: () = msg_send![pool, drain];
-        result
-    }
+fn mtm() -> Result<MainThreadMarker> {
+    MainThreadMarker::new().context("AppKit usage requires running on the main thread")
 }
 
 #[derive(Clone)]
@@ -80,28 +66,35 @@ struct TargetState {
     handler: Handler,
 }
 
-fn target_class() -> Result<&'static Class> {
-    static CLASS: OnceLock<&'static Class> = OnceLock::new();
+fn target_class() -> Result<&'static AnyClass> {
+    static CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
 
     if let Some(class) = CLASS.get() {
         return Ok(class);
     }
 
-    if let Some(existing) = Class::get("GpuiTrayTarget") {
+    if let Some(existing) = AnyClass::get(c"GpuiTrayTarget") {
         let _ = CLASS.set(existing);
         return Ok(existing);
     }
 
-    let class = unsafe {
-        let superclass = class!(NSObject);
-        let mut decl = ClassDecl::new("GpuiTrayTarget", superclass)
+    let class = {
+        let mut builder = ClassBuilder::new(c"GpuiTrayTarget", NSObject::class())
             .context("failed to create Objective-C class declaration")?;
 
-        decl.add_ivar::<*mut c_void>("rust_state");
+        builder.add_ivar::<*mut c_void>(c"rust_state");
 
-        extern "C" fn on_menu_item(this: &Object, _cmd: Sel, sender: id) {
+        extern "C" fn on_menu_item(this: *mut NSObject, _cmd: Sel, sender: *mut AnyObject) {
             unsafe {
-                let state_ptr: *mut c_void = *this.get_ivar("rust_state");
+                let Some(this) = this.as_ref() else {
+                    return;
+                };
+                if sender.is_null() {
+                    return;
+                }
+                let cls = AnyClass::get(c"GpuiTrayTarget").unwrap();
+                let ivar = cls.instance_variable(c"rust_state").unwrap();
+                let state_ptr = *ivar.load::<*mut c_void>(this);
                 if state_ptr.is_null() {
                     return;
                 }
@@ -112,25 +105,32 @@ fn target_class() -> Result<&'static Class> {
             }
         }
 
-        extern "C" fn dealloc(this: &mut Object, _cmd: Sel) {
+        extern "C" fn dealloc(this: *mut NSObject, _cmd: Sel) {
             unsafe {
-                let state_ptr: *mut c_void = *this.get_ivar("rust_state");
+                let Some(this_ref) = this.as_ref() else {
+                    return;
+                };
+                let cls = AnyClass::get(c"GpuiTrayTarget").unwrap();
+                let ivar = cls.instance_variable(c"rust_state").unwrap();
+                let state_ptr = *ivar.load::<*mut c_void>(this_ref);
                 if !state_ptr.is_null() {
                     drop(Box::from_raw(state_ptr as *mut TargetState));
-                    this.set_ivar("rust_state", std::ptr::null_mut::<c_void>());
+                    *ivar.load_ptr::<*mut c_void>(this_ref) = std::ptr::null_mut::<c_void>();
                 }
-                let superclass = class!(NSObject);
-                let _: () = msg_send![super(this, superclass), dealloc];
+                // Super calls require a mutable message receiver.
+                let this_any: &mut AnyObject = &mut *this.cast::<AnyObject>();
+                let _: () = msg_send![super(this_any, NSObject::class()), dealloc];
             }
         }
 
-        decl.add_method(
-            sel!(onMenuItem:),
-            on_menu_item as extern "C" fn(&Object, Sel, id),
-        );
-        decl.add_method(sel!(dealloc), dealloc as extern "C" fn(&mut Object, Sel));
+        unsafe {
+            let on_menu_item_fn: extern "C" fn(*mut NSObject, Sel, *mut AnyObject) = on_menu_item;
+            let dealloc_fn: extern "C" fn(*mut NSObject, Sel) = dealloc;
+            builder.add_method::<NSObject, _>(sel!(onMenuItem:), on_menu_item_fn);
+            builder.add_method::<NSObject, _>(sel!(dealloc), dealloc_fn);
+        }
 
-        decl.register()
+        builder.register()
     };
 
     let _ = CLASS.set(class);
@@ -138,9 +138,10 @@ fn target_class() -> Result<&'static Class> {
 }
 
 struct Tray {
-    status_item: id,
-    menu: id,
-    target: id,
+    mtm: MainThreadMarker,
+    status_item: Option<Retained<NSStatusItem>>,
+    menu: Retained<NSMenu>,
+    target: Retained<AnyObject>,
     handler: Handler,
 }
 
@@ -150,23 +151,16 @@ thread_local! {
 
 impl Drop for Tray {
     fn drop(&mut self) {
-        unsafe {
-            if self.status_item != nil {
-                let _: () = msg_send![
-                    NSStatusBar::systemStatusBar(nil),
-                    removeStatusItem: self.status_item
-                ];
-            }
-            let _: () = msg_send![self.menu, release];
-            let _: () = msg_send![self.target, release];
+        if let Some(item) = self.status_item.take() {
+            NSStatusBar::systemStatusBar().removeStatusItem(&item);
         }
     }
 }
 
 pub fn set_up_tray(cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem) -> Result<()> {
     with_pool(|| unsafe {
-        let menu = NSMenu::new(nil);
-        let _: () = msg_send![menu, retain];
+        let mtm = mtm()?;
+        let menu = NSMenu::new(mtm);
 
         let callback = Arc::new(Mutex::new(item.event.take()));
         let tag_to_id = Arc::new(Mutex::new(HashMap::new()));
@@ -181,11 +175,10 @@ pub fn set_up_tray(cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem) 
         });
 
         let target_class = target_class()?;
-        let target: id = msg_send![target_class, new];
-        let _: () = msg_send![target, retain];
-
         let state_ptr = Box::into_raw(state) as *mut c_void;
-        (*target).set_ivar("rust_state", state_ptr);
+        let target: Retained<AnyObject> = msg_send![target_class, new];
+        let ivar = target_class.instance_variable(c"rust_state").unwrap();
+        *ivar.load_ptr::<*mut c_void>(&*target) = state_ptr;
 
         TRAY.with(|tray_cell| {
             let mut tray_slot = tray_cell
@@ -195,7 +188,8 @@ pub fn set_up_tray(cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem) 
                 anyhow::bail!("tray already initialized");
             }
             *tray_slot = Some(Tray {
-                status_item: nil,
+                mtm,
+                status_item: None,
                 menu,
                 target,
                 handler,
@@ -207,7 +201,7 @@ pub fn set_up_tray(cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem) 
     })
 }
 
-pub fn sync_tray(cx: &mut gpui::App, mut item: TrayItem) -> Result<()> {
+pub fn sync_tray(_cx: &mut gpui::App, mut item: TrayItem) -> Result<()> {
     with_pool(|| {
         TRAY.with(|tray_cell| {
             let mut tray_slot = tray_cell
@@ -237,67 +231,51 @@ impl Tray {
 
         self.rebuild_menu(&item.submenus)?;
 
-        unsafe {
-            let status_item = self.status_item;
-            (status_item != nil)
-                .then_some(())
-                .context("status item is nil")?;
+        let status_item = self.status_item.as_ref().context("status item is nil")?;
+        status_item.setMenu(Some(&self.menu));
 
-            let _: () = msg_send![status_item, setMenu: self.menu];
+        let button = status_item
+            .button(self.mtm)
+            .context("status item button is nil")?;
 
-            let button: id = msg_send![status_item, button];
-            (button != nil)
-                .then_some(())
-                .context("status item button is nil")?;
+        let tooltip = NSString::from_str(item.tooltip.as_str());
+        button.setToolTip(Some(&tooltip));
 
-            let tooltip = NSString::alloc(nil).init_str(item.tooltip.as_str());
-            let _: () = msg_send![button, setToolTip: tooltip];
+        let title = NSString::from_str(item.title.as_str());
+        button.setTitle(&title);
 
-            let title = NSString::alloc(nil).init_str(item.title.as_str());
-            let _: () = msg_send![button, setTitle: title];
+        // Note: keep using an embedded PNG icon for simplicity.
+        let nsdata = unsafe {
+            NSData::dataWithBytes_length(APP_ICON_PNG.as_ptr().cast(), APP_ICON_PNG.len() as _)
+        };
+        let nsimage = NSImage::initWithData(NSImage::alloc(), &nsdata)
+            .context("failed to create NSImage from icon bytes")?;
 
-            // Note: keep using an embedded PNG icon for simplicity.
-            let nsdata =
-                NSData::dataWithBytes_length_(nil, APP_ICON_PNG.as_ptr() as *const _, APP_ICON_PNG.len() as u64);
-            let nsimage: id = msg_send![class!(NSImage), alloc];
-            let nsimage: id = msg_send![nsimage, initWithData: nsdata];
-            (nsimage != nil)
-                .then_some(())
-                .context("failed to create NSImage from icon bytes")?;
-
-            let new_size = NSSize::new(18., 18.);
-            let _: () = msg_send![button, setImage: nsimage];
-            let _: () = msg_send![nsimage, setSize: new_size];
-            let _: () = msg_send![button, setImagePosition: CellImagePosition::ImageLeft];
-            let _: () = msg_send![nsimage, setTemplate: true];
-        }
+        let new_size = NSSize::new(18., 18.);
+        button.setImage(Some(&nsimage));
+        nsimage.setSize(new_size);
+        button.setImagePosition(NSCellImagePosition::ImageLeft);
+        nsimage.setTemplate(true);
 
         Ok(())
     }
 
     fn set_visible(&mut self, visible: bool) -> Result<()> {
         if visible {
-            if self.status_item != nil {
+            if self.status_item.is_some() {
                 return Ok(());
             }
 
-            unsafe {
-                let status_item: id = NSStatusBar::systemStatusBar(nil)
-                    .statusItemWithLength_(NSVariableStatusItemLength);
-                let _: () = msg_send![status_item, retain];
-                self.status_item = status_item;
-            }
+            let status_bar = NSStatusBar::systemStatusBar();
+            let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
+            self.status_item = Some(status_item);
         } else {
-            if self.status_item == nil {
+            if self.status_item.is_none() {
                 return Ok(());
             }
-            unsafe {
-                let _: () = msg_send![
-                    NSStatusBar::systemStatusBar(nil),
-                    removeStatusItem: self.status_item
-                ];
+            if let Some(item) = self.status_item.take() {
+                NSStatusBar::systemStatusBar().removeStatusItem(&item);
             }
-            self.status_item = nil;
         }
 
         Ok(())
@@ -305,7 +283,7 @@ impl Tray {
 
     fn rebuild_menu(&mut self, items: &[TrayMenuItem]) -> Result<()> {
         with_pool(|| unsafe {
-            let _: () = msg_send![self.menu, removeAllItems];
+            self.menu.removeAllItems();
 
             if let Ok(mut map) = self.handler.tag_to_id.lock() {
                 map.clear();
@@ -314,10 +292,11 @@ impl Tray {
             let mut next_tag: i64 = 1;
             for item in items {
                 add_tray_menu_item(
-                    self.menu,
+                    &self.menu,
                     item,
                     &self.handler,
-                    self.target,
+                    &self.target,
+                    self.mtm,
                     &mut next_tag,
                 )?;
             }
@@ -328,16 +307,17 @@ impl Tray {
 }
 
 unsafe fn add_tray_menu_item(
-    menu: id,
+    menu: &NSMenu,
     item: &TrayMenuItem,
     handler: &Handler,
-    target: id,
+    target: &AnyObject,
+    mtm: MainThreadMarker,
     next_tag: &mut i64,
 ) -> Result<()> {
     match item {
         TrayMenuItem::Separator { .. } => {
-            let separator: id = NSMenuItem::separatorItem(nil);
-            let _: () = msg_send![menu, addItem: separator];
+            let separator = NSMenuItem::separatorItem(mtm);
+            menu.addItem(&separator);
         }
         TrayMenuItem::Submenu {
             id: user_id,
@@ -353,56 +333,53 @@ unsafe fn add_tray_menu_item(
                     map.insert(tag, user_id.clone());
                 }
 
-                let title = NSString::alloc(nil).init_str(label.as_str());
-                let key_equiv = NSString::alloc(nil).init_str("");
+                let title = NSString::from_str(label.as_str());
+                let key_equiv = NSString::from_str("");
+                let menu_item = unsafe {
+                    NSMenuItem::initWithTitle_action_keyEquivalent(
+                        NSMenuItem::alloc(mtm),
+                        &title,
+                        Some(sel!(onMenuItem:)),
+                        &key_equiv,
+                    )
+                };
 
-                let item: id = msg_send![class!(NSMenuItem), alloc];
-                let item: id = msg_send![
-                    item,
-                    initWithTitle: title
-                    action: sel!(onMenuItem:)
-                    keyEquivalent: key_equiv
-                ];
-                (item != nil)
-                    .then_some(())
-                    .context("failed to create NSMenuItem")?;
-
-                let _: () = msg_send![item, setTarget: target];
-                let _: () = msg_send![item, setTag: tag];
+                unsafe { menu_item.setTarget(Some(target)) };
+                menu_item.setTag(tag as _);
 
                 let checked = match toggle_type {
                     Some(TrayToggleType::Checkbox(checked)) => *checked,
                     Some(TrayToggleType::Radio(checked)) => *checked,
                     None => false,
                 };
-                let state_value = if checked { 1i64 } else { 0i64 };
-                let _: () = msg_send![item, setState: state_value];
+                let state_value = if checked {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                };
+                menu_item.setState(state_value);
 
-                let _: () = msg_send![menu, addItem: item];
-                let _: () = msg_send![item, release];
+                menu.addItem(&menu_item);
             } else {
-                let title = NSString::alloc(nil).init_str(label.as_str());
-                let key_equiv = NSString::alloc(nil).init_str("");
+                let title = NSString::from_str(label.as_str());
+                let key_equiv = NSString::from_str("");
 
-                let submenu_item: id = msg_send![class!(NSMenuItem), alloc];
-                let submenu_item: id = msg_send![
-                    submenu_item,
-                    initWithTitle: title
-                    action: std::ptr::null::<c_void>()
-                    keyEquivalent: key_equiv
-                ];
-                (submenu_item != nil)
-                    .then_some(())
-                    .context("failed to create submenu NSMenuItem")?;
+                let submenu_item = unsafe {
+                    NSMenuItem::initWithTitle_action_keyEquivalent(
+                        NSMenuItem::alloc(mtm),
+                        &title,
+                        None,
+                        &key_equiv,
+                    )
+                };
 
-                let submenu = NSMenu::new(nil);
+                let submenu = NSMenu::new(mtm);
                 for child in children {
-                    add_tray_menu_item(submenu, child, handler, target, next_tag)?;
+                    add_tray_menu_item(&submenu, child, handler, target, mtm, next_tag)?;
                 }
 
-                let _: () = msg_send![submenu_item, setSubmenu: submenu];
-                let _: () = msg_send![menu, addItem: submenu_item];
-                let _: () = msg_send![submenu_item, release];
+                submenu_item.setSubmenu(Some(&submenu));
+                menu.addItem(&submenu_item);
             }
         }
     }

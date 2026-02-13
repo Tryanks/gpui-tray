@@ -1,6 +1,6 @@
 use gpui::{
-    actions, div, prelude::*, App, Application, Context, Div, Global, QuitMode, SharedString,
-    Stateful, Window, WindowOptions,
+    App, Application, Context, Div, Global, QuitMode, SharedString, Stateful, Window,
+    WindowOptions, actions, div, prelude::*,
 };
 use gpui_tray::{TrayEvent, TrayIcon, TrayItem, TrayMenuItem};
 
@@ -272,9 +272,7 @@ fn show_window(_: &ShowWindow, cx: &mut App) {
         return;
     }
 
-    if let Err(error) =
-        cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| Example))
-    {
+    if let Err(error) = cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| Example)) {
         eprintln!("failed to open window: {error:#}");
     }
     cx.activate(true);
@@ -282,8 +280,8 @@ fn show_window(_: &ShowWindow, cx: &mut App) {
 
 #[cfg(target_os = "macos")]
 fn set_shows_in_dock(shows_in_dock: bool) -> anyhow::Result<()> {
-    use cocoa::base::id;
-    use objc::{class, msg_send, sel, sel_impl};
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
 
     #[repr(i64)]
     enum ActivationPolicy {
@@ -292,7 +290,7 @@ fn set_shows_in_dock(shows_in_dock: bool) -> anyhow::Result<()> {
     }
 
     unsafe {
-        let app: id = msg_send![class!(NSApplication), sharedApplication];
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
         if app.is_null() {
             anyhow::bail!("NSApplication.sharedApplication returned nil");
         }
@@ -311,4 +309,3 @@ fn set_shows_in_dock(shows_in_dock: bool) -> anyhow::Result<()> {
 
     Ok(())
 }
-
