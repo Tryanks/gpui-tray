@@ -1,6 +1,6 @@
 use gpui::{
     App, Application, Context, Div, Global, QuitMode, SharedString, Stateful, Window,
-    WindowOptions, actions, div, prelude::*,
+    WindowOptions, actions, div, prelude::*, Menu, MenuItem,
 };
 use gpui_tray::{TrayEvent, TrayIcon, TrayItem, TrayMenuItem};
 
@@ -154,6 +154,12 @@ fn main() -> anyhow::Result<()> {
         .with_quit_mode(QuitMode::Explicit)
         .run(|cx: &mut App| {
             cx.set_global(AppState::new());
+
+            // Ensure macOS shows our app's menu bar when our window is frontmost.
+            cx.set_menus(vec![Menu {
+                name: "tray_demo".into(),
+                items: vec![MenuItem::action("Quit", Quit)],
+            }]);
 
             cx.activate(true);
             cx.on_action(quit);
