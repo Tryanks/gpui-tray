@@ -8,7 +8,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-gpui_tray = { git = "https://github.com/Tryanks/gpui_tray" }
+gpui-tray = { git = "https://github.com/Tryanks/gpui_tray" }
 ```
 
 Create and install a tray item:

@@ -85,7 +85,7 @@ impl Render for Example {
             .size_full()
             .justify_center()
             .items_center()
-            .child("Tray demo (gpui_tray)")
+            .child("Tray demo (gpui-tray)")
             .child(
                 div()
                     .flex()
