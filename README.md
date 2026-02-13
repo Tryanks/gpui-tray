@@ -2,21 +2,46 @@
 
 Cross-platform system tray support for apps using upstream `gpui` (from the Zed repository), without modifying `gpui`.
 
-## Notes
+## Use
 
-- The `gpui` dependency is pulled from Zed by tag.
-- On macOS, this repo pins `core-text` to match Zed's lockfile expectations; otherwise Cargo may resolve versions that break `zed-font-kit`.
+Add the dependency:
+
+```toml
+[dependencies]
+gpui_tray = { git = "https://github.com/Tryanks/gpui_tray" }
+```
+
+Create and install a tray item:
+
+```rust
+use gpui::{App, Application};
+use gpui_tray::{TrayEvent, TrayIcon, TrayItem, TrayMenuItem};
+
+fn main() -> anyhow::Result<()> {
+    Application::new().run(|cx: &mut App| {
+        let async_app = cx.to_async();
+
+        let item = TrayItem::new()
+            .visible(true)
+            .icon(TrayIcon::Name("folder".to_string()))
+            .title("My App")
+            .tooltip("Hello from tray")
+            .submenu(TrayMenuItem::menu("quit", "Quit", Vec::new()))
+            .on_event(|event, cx| match event {
+                TrayEvent::MenuClick { id } if id == "quit" => cx.quit(),
+                _ => {}
+            });
+
+        gpui_tray::tray::set_up_tray(cx, async_app, item).ok();
+    });
+    Ok(())
+}
+```
+
+Update the tray later by calling `gpui_tray::tray::sync_tray(cx, item)` with a new `TrayItem`.
 
 ## Run Demo
 
 ```bash
 cargo run --example tray_demo
 ```
-
-Tray debug log (macOS): `/tmp/gpui_tray_demo_tray.log`
-
-## Platforms
-
-- macOS: implemented via AppKit (`NSStatusItem`).
-- Windows: implemented via Win32 tray icon (`Shell_NotifyIconW`) and a hidden window.
-- Linux: implemented via StatusNotifierItem (DBus) using `ksni`.

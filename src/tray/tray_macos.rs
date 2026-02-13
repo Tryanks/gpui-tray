@@ -20,8 +20,6 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     ffi::c_void,
-    fs::OpenOptions,
-    io::Write as _,
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -41,18 +39,6 @@ fn with_pool<T>(f: impl FnOnce() -> T) -> T {
         let result = f();
         let _: () = msg_send![pool, drain];
         result
-    }
-}
-
-fn debug_log(message: &str) {
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/gpui_tray_demo_tray.log")
-    {
-        if let Err(error) = writeln!(file, "{message}") {
-            eprintln!("failed to write tray debug log: {error:#}");
-        }
     }
 }
 
@@ -300,7 +286,6 @@ impl Tray {
                     .statusItemWithLength_(NSVariableStatusItemLength);
                 let _: () = msg_send![status_item, retain];
                 self.status_item = status_item;
-                debug_log(&format!("tray: created status item: {status_item:?}"));
             }
         } else {
             if self.status_item == nil {
@@ -424,4 +409,3 @@ unsafe fn add_tray_menu_item(
 
     Ok(())
 }
-
