@@ -1,4 +1,4 @@
-use crate::tray::{TrayEvent, TrayIcon, TrayItem, TrayMenuItem, TrayToggleType};
+use crate::tray::{TrayEvent, TrayItem, TrayMenuItem, TrayToggleType};
 use anyhow::Result;
 use gpui::{AsyncApp, MouseButton, Point};
 use ksni::menu::{CheckmarkItem, StandardItem, SubMenu};
@@ -42,21 +42,7 @@ struct LinuxTray {
 
 impl LinuxTray {
     fn from_item(handler: Handler, mut item: TrayItem) -> Self {
-        let (icon_name, icon_pixmap) = match item.icon {
-            TrayIcon::Name(name) => (name, Vec::new()),
-            TrayIcon::Image {
-                width,
-                height,
-                bytes,
-            } => (
-                String::new(),
-                vec![Icon {
-                    width: width as i32,
-                    height: height as i32,
-                    data: bytes,
-                }],
-            ),
-        };
+        let icon_pixmap = icon_pixmap_from_item(&item).unwrap_or_default();
 
         // Callback is stored in the handler; item.event is consumed by set_up/sync.
         item.event = None;
@@ -67,34 +53,20 @@ impl LinuxTray {
             title: item.title,
             tooltip: item.tooltip,
             description: item.description,
-            icon_name,
+            icon_name: String::new(),
             icon_pixmap,
             menu: item.submenus,
         }
     }
 
     fn update_from_item(&mut self, mut item: TrayItem) {
-        let (icon_name, icon_pixmap) = match item.icon {
-            TrayIcon::Name(name) => (name, Vec::new()),
-            TrayIcon::Image {
-                width,
-                height,
-                bytes,
-            } => (
-                String::new(),
-                vec![Icon {
-                    width: width as i32,
-                    height: height as i32,
-                    data: bytes,
-                }],
-            ),
-        };
+        let icon_pixmap = icon_pixmap_from_item(&item).unwrap_or_default();
 
         self.visible = item.visible;
         self.title = item.title;
         self.tooltip = item.tooltip;
         self.description = item.description;
-        self.icon_name = icon_name;
+        self.icon_name = String::new();
         self.icon_pixmap = icon_pixmap;
         self.menu = item.submenus;
 
@@ -152,6 +124,39 @@ impl LinuxTray {
             })
             .collect()
     }
+}
+
+fn icon_pixmap_from_item(item: &TrayItem) -> Result<Option<Vec<Icon>>> {
+    let Some(icon) = item.icon.as_ref() else {
+        return Ok(None);
+    };
+
+    let (width, height, bgra) = crate::icon::decode_gpui_image_to_bgra32(icon)?;
+    let data = bgra32_to_argb32(&bgra)?;
+    Ok(Some(vec![Icon {
+        width: width as i32,
+        height: height as i32,
+        data,
+    }]))
+}
+
+fn bgra32_to_argb32(bgra: &[u8]) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        bgra.len() % 4 == 0,
+        "expected BGRA32 byte length multiple of 4"
+    );
+    let mut argb = vec![0u8; bgra.len()];
+    for (src, dst) in bgra.chunks_exact(4).zip(argb.chunks_exact_mut(4)) {
+        let b = src[0];
+        let g = src[1];
+        let r = src[2];
+        let a = src[3];
+        dst[0] = a;
+        dst[1] = r;
+        dst[2] = g;
+        dst[3] = b;
+    }
+    Ok(argb)
 }
 
 impl Tray for LinuxTray {

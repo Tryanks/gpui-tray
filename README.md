@@ -15,7 +15,7 @@ Create and install a tray item:
 
 ```rust
 use gpui::{App, Application};
-use gpui_tray::{TrayEvent, TrayIcon, TrayItem, TrayMenuItem};
+use gpui_tray::{TrayEvent, TrayItem, TrayMenuItem};
 
 fn main() -> anyhow::Result<()> {
     Application::new().run(|cx: &mut App| {
@@ -23,7 +23,10 @@ fn main() -> anyhow::Result<()> {
 
         let item = TrayItem::new()
             .visible(true)
-            .icon(TrayIcon::Name("folder".to_string()))
+            .icon(gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                include_bytes!("app-icon.png").to_vec(),
+            ))
             .title("My App")
             .tooltip("Hello from tray")
             .submenu(TrayMenuItem::menu("quit", "Quit", Vec::new()))
@@ -39,6 +42,10 @@ fn main() -> anyhow::Result<()> {
 ```
 
 Update the tray later by calling `gpui_tray::tray::sync_tray(cx, item)` with a new `TrayItem`.
+
+### Icon Notes
+
+- `.icon(...)` takes anything convertible into `gpui::Image` (e.g. `gpui::Image::from_bytes(...)`).
 
 ## Run Demo
 

@@ -2,7 +2,7 @@ use gpui::{
     App, Application, Context, Div, Global, Menu, MenuItem, QuitMode, SharedString, Stateful,
     Window, WindowOptions, actions, div, prelude::*,
 };
-use gpui_tray::{TrayEvent, TrayIcon, TrayItem, TrayMenuItem};
+use gpui_tray::{TrayEvent, TrayItem, TrayMenuItem};
 
 #[derive(PartialEq)]
 enum ViewMode {
@@ -115,7 +115,10 @@ fn build_tray_item(app_state: &AppState) -> TrayItem {
 
     TrayItem::new()
         .visible(app_state.tray_visible)
-        .icon(TrayIcon::Name("folder".to_string()))
+        .icon(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            include_bytes!("app-icon.png").to_vec(),
+        ))
         .title(app_state.tray_title.to_string())
         .tooltip(app_state.tray_tooltip.to_string())
         .description(String::new())

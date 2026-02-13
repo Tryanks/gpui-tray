@@ -1,17 +1,5 @@
-use gpui::{App, AsyncApp, MouseButton, Point};
-
-/// An icon displayed in a tray menu.
-#[derive(Clone, Debug)]
-pub enum TrayIcon {
-    /// Freedesktop/AppKit/Win32 theme icon name (platform dependent).
-    Name(String),
-    /// ARGB32 icon bytes.
-    Image {
-        width: u32,
-        height: u32,
-        bytes: Vec<u8>,
-    },
-}
+use gpui::{App, AsyncApp, Image, MouseButton, Point};
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug)]
 pub enum TrayToggleType {
@@ -92,7 +80,7 @@ pub enum TrayEvent {
 
 pub struct TrayItem {
     pub(crate) visible: bool,
-    pub(crate) icon: TrayIcon,
+    pub(crate) icon: Option<Rc<Image>>,
     pub(crate) title: String,
     pub(crate) tooltip: String,
     pub(crate) description: String,
@@ -104,7 +92,7 @@ impl TrayItem {
     pub fn new() -> Self {
         Self {
             visible: true,
-            icon: TrayIcon::Name(String::new()),
+            icon: None,
             title: String::new(),
             tooltip: String::new(),
             description: String::new(),
@@ -118,8 +106,8 @@ impl TrayItem {
         self
     }
 
-    pub fn icon(mut self, icon: TrayIcon) -> Self {
-        self.icon = icon;
+    pub fn icon(mut self, icon: impl Into<Image>) -> Self {
+        self.icon = Some(Rc::new(icon.into()));
         self
     }
 

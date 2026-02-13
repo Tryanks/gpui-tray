@@ -11,10 +11,13 @@ gpui = { git = "https://github.com/zed-industries/zed" }
 objc2 = "0"
 objc2-foundation = { version = "0", features = ["NSData", "NSGeometry", "NSObject", "NSString"] }
 objc2-app-kit = { version = "0", features = [
+  "NSBitmapImageRep",
   "NSButton",
   "NSCell",
   "NSControl",
+  "NSGraphics",
   "NSImage",
+  "NSImageRep",
   "NSMenu",
   "NSMenuItem",
   "NSResponder",

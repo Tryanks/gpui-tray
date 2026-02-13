@@ -18,8 +18,6 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-const APP_ICON_PNG: &[u8] = include_bytes!("../image/app-icon.png");
-
 fn with_pool<T>(f: impl FnOnce() -> T) -> T {
     autoreleasepool(|_| f())
 }
@@ -244,18 +242,17 @@ impl Tray {
         let title = NSString::from_str(item.title.as_str());
         button.setTitle(&title);
 
-        // Note: keep using an embedded PNG icon for simplicity.
-        let nsdata = unsafe {
-            NSData::dataWithBytes_length(APP_ICON_PNG.as_ptr().cast(), APP_ICON_PNG.len() as _)
-        };
-        let nsimage = NSImage::initWithData(NSImage::alloc(), &nsdata)
-            .context("failed to create NSImage from icon bytes")?;
+        let nsimage = item.icon.as_deref().map(nsimage_from_image).transpose()?;
 
-        let new_size = NSSize::new(18., 18.);
-        button.setImage(Some(&nsimage));
-        nsimage.setSize(new_size);
-        button.setImagePosition(NSCellImagePosition::ImageLeft);
-        nsimage.setTemplate(true);
+        if let Some(nsimage) = nsimage {
+            let new_size = NSSize::new(18., 18.);
+            button.setImage(Some(&nsimage));
+            nsimage.setSize(new_size);
+            button.setImagePosition(NSCellImagePosition::ImageLeft);
+            nsimage.setTemplate(true);
+        } else {
+            button.setImage(None);
+        }
 
         Ok(())
     }
@@ -304,6 +301,14 @@ impl Tray {
             Ok(())
         })
     }
+}
+
+fn nsimage_from_image(image: &gpui::Image) -> Result<Retained<NSImage>> {
+    let nsdata = unsafe {
+        NSData::dataWithBytes_length(image.bytes.as_ptr().cast(), image.bytes.len() as _)
+    };
+    NSImage::initWithData(NSImage::alloc(), &nsdata)
+        .context("failed to create NSImage from gpui::Image bytes")
 }
 
 unsafe fn add_tray_menu_item(
