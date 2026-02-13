@@ -11,26 +11,30 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 use windows_sys::Win32::{
-    Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT as WIN_POINT, WPARAM},
+    Foundation::{BOOL, HMODULE, HWND, LPARAM, LRESULT, POINT as WIN_POINT, WPARAM},
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Shell::{
             NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
-            NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
+            NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
         },
         WindowsAndMessaging::{
             AppendMenuW, CREATESTRUCTW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW,
             DefWindowProcW, DestroyMenu, DestroyWindow, GetCursorPos, HMENU, IDC_ARROW,
             IDI_APPLICATION, LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING,
             MF_UNCHECKED, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-            TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TrackPopupMenu, WM_APP, WM_COMMAND,
-            WM_CREATE, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+            WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+            WM_LBUTTONUP, WM_NULL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_USER, WNDCLASSW,
+            WS_OVERLAPPEDWINDOW,
         },
     },
 };
 
-const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
-const WM_TRAY_OPEN_MENU: u32 = WM_APP + 2;
+// Tray callback must be in WM_USER..0x7FFF per Shell_NotifyIconW requirements.
+const TRAY_CALLBACK_MESSAGE: u32 = WM_USER + 1;
+const WM_TRAY_OPEN_MENU: u32 = WM_USER + 2;
+
 
 #[derive(Clone)]
 struct Handler {
@@ -128,10 +132,14 @@ unsafe extern "system" fn wndproc(
             0
         }
         TRAY_CALLBACK_MESSAGE => {
-            let event = lparam as u32;
-            if event == WM_RBUTTONUP {
+            let event = (lparam as u32) & 0xFFFF;
+            if event == WM_RBUTTONUP || event == WM_RBUTTONDOWN || event == WM_CONTEXTMENU {
                 let _ = PostMessageW(hwnd, WM_TRAY_OPEN_MENU, 0, 0);
-            } else if event == WM_LBUTTONUP {
+            } else if event == WM_LBUTTONUP
+                || event == WM_LBUTTONDOWN
+                || event == WM_LBUTTONDBLCLK
+                || event == NIN_SELECT
+            {
                 let _ = PostMessageW(hwnd, WM_TRAY_OPEN_MENU, 1, 0);
             }
             0
@@ -158,7 +166,7 @@ unsafe extern "system" fn wndproc(
             let _ = SetForegroundWindow(hwnd);
             let command = TrackPopupMenu(
                 tray.menu,
-                TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD,
+                TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD | TPM_RIGHTBUTTON,
                 point.x,
                 point.y,
                 0,
@@ -169,6 +177,7 @@ unsafe extern "system" fn wndproc(
             if command != 0 {
                 let _ = PostMessageW(hwnd, WM_COMMAND, command as usize, 0);
             }
+            let _ = PostMessageW(hwnd, WM_NULL, 0, 0);
 
             0
         }
@@ -189,7 +198,7 @@ unsafe extern "system" fn wndproc(
     }
 }
 
-fn register_window_class(instance: HINSTANCE) -> Result<()> {
+fn register_window_class(instance: HMODULE) -> Result<()> {
     static REGISTERED: OnceLock<()> = OnceLock::new();
     if REGISTERED.get().is_some() {
         return Ok(());
@@ -249,7 +258,10 @@ impl Tray {
             .context("Shell_NotifyIconW(NIM_ADD) failed")?;
 
         let mut data_version = data;
-        data_version.uVersion = NOTIFYICON_VERSION_4;
+        // `uVersion` lives in an anonymous union in windows-sys 0.48
+        unsafe {
+            data_version.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+        }
         let _ = Shell_NotifyIconW(NIM_SETVERSION, &data_version);
 
         self.icon_added = true;

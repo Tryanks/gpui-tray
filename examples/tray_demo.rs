@@ -267,7 +267,13 @@ fn show_window(_: &ShowWindow, cx: &mut App) {
         }
     }
 
-    if cx.active_window().is_some() || !cx.windows().is_empty() {
+    if let Some(handle) = cx
+        .active_window()
+        .or_else(|| cx.windows().iter().next().cloned())
+    {
+        let _ = handle.update(cx, |_, window, _| {
+            window.activate_window();
+        });
         cx.activate(true);
         return;
     }
