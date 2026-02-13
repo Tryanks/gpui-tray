@@ -1,0 +1,32 @@
+[package]
+name = "gpui_tray"
+version = "0.1.0"
+edition = "2024"
+
+# Prevent Cargo from walking up to the gpui-ce workspace.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+log = "0.4"
+
+# gpui is a workspace crate inside Zed, so depend on it as a git dependency.
+gpui = { git = "https://github.com/zed-industries/zed", tag = "v0.223.3", package = "gpui" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "=0.26.0"
+objc = "0.2"
+# Important: pin to versions known to work with the gpui tag above.
+# Without this, Cargo may pick newer patch releases that break zed-font-kit.
+core-text = "=21.0.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.2"
