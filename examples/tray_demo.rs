@@ -259,7 +259,7 @@ fn toggle_visible(_: &ToggleVisible, cx: &mut App) {
 
 fn hide_window(_: &HideWindow, cx: &mut App) {
     cx.defer(|cx| {
-        let handles: Vec<_> = cx.windows().iter().cloned().collect();
+        let handles: Vec<_> = cx.windows().to_vec();
         for handle in handles {
             if let Err(error) = handle.update(cx, |_, window, _| window.remove_window()) {
                 eprintln!("failed to remove window: {error:#}");
@@ -276,10 +276,7 @@ fn show_window(_: &ShowWindow, cx: &mut App) {
         }
     }
 
-    if let Some(handle) = cx
-        .active_window()
-        .or_else(|| cx.windows().iter().next().cloned())
-    {
+    if let Some(handle) = cx.active_window().or_else(|| cx.windows().first().cloned()) {
         let _ = handle.update(cx, |_, window, _| {
             window.activate_window();
         });

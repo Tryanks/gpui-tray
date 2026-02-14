@@ -1,5 +1,9 @@
 use gpui::{App, AsyncApp, Image, MouseButton, Point};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
+pub(crate) type TrayEventCallback = Box<dyn FnMut(TrayEvent, &mut App) + Send + 'static>;
+pub(crate) type TrayEventCallbackSlot = Arc<Mutex<Option<TrayEventCallback>>>;
 
 #[derive(Clone, Copy, Debug)]
 pub enum TrayToggleType {
@@ -85,7 +89,7 @@ pub struct TrayItem {
     pub(crate) tooltip: String,
     pub(crate) description: String,
     pub(crate) submenus: Vec<TrayMenuItem>,
-    pub(crate) event: Option<Box<dyn FnMut(TrayEvent, &mut App) + Send + 'static>>,
+    pub(crate) event: Option<TrayEventCallback>,
 }
 
 impl TrayItem {
@@ -134,6 +138,12 @@ impl TrayItem {
     pub fn on_event(mut self, event: impl FnMut(TrayEvent, &mut App) + Send + 'static) -> Self {
         self.event = Some(Box::new(event));
         self
+    }
+}
+
+impl Default for TrayItem {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

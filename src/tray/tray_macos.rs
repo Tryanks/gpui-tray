@@ -1,6 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::tray::{TrayEvent, TrayItem, TrayMenuItem, TrayToggleType};
+use crate::tray::{TrayEvent, TrayEventCallbackSlot, TrayItem, TrayMenuItem, TrayToggleType};
 use anyhow::{Context as _, Result};
 use gpui::AsyncApp;
 use objc2::rc::{Retained, autoreleasepool};
@@ -29,7 +29,7 @@ fn mtm() -> Result<MainThreadMarker> {
 #[derive(Clone)]
 struct Handler {
     async_app: AsyncApp,
-    callback: Arc<Mutex<Option<Box<dyn FnMut(TrayEvent, &mut gpui::App) + Send + 'static>>>>,
+    callback: TrayEventCallbackSlot,
     tag_to_id: Arc<Mutex<HashMap<i64, String>>>,
 }
 
@@ -39,10 +39,10 @@ impl Handler {
         let callback = self.callback.clone();
         async_app.update(|cx| {
             cx.defer(move |cx| {
-                if let Ok(mut slot) = callback.lock() {
-                    if let Some(cb) = slot.as_mut() {
-                        cb(event, cx);
-                    }
+                if let Ok(mut slot) = callback.lock()
+                    && let Some(cb) = slot.as_mut()
+                {
+                    cb(event, cx);
                 }
             });
         });
@@ -176,7 +176,7 @@ pub fn set_up_tray(cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem) 
         let state_ptr = Box::into_raw(state) as *mut c_void;
         let target: Retained<AnyObject> = msg_send![target_class, new];
         let ivar = target_class.instance_variable(c"rust_state").unwrap();
-        *ivar.load_ptr::<*mut c_void>(&*target) = state_ptr;
+        *ivar.load_ptr::<*mut c_void>(&target) = state_ptr;
 
         TRAY.with(|tray_cell| {
             let mut tray_slot = tray_cell
@@ -209,10 +209,10 @@ pub fn sync_tray(_cx: &mut gpui::App, mut item: TrayItem) -> Result<()> {
                 .as_mut()
                 .context("tray has not been initialized")?;
 
-            if let Some(cb) = item.event.take() {
-                if let Ok(mut slot) = tray.handler.callback.lock() {
-                    *slot = Some(cb);
-                }
+            if let Some(cb) = item.event.take()
+                && let Ok(mut slot) = tray.handler.callback.lock()
+            {
+                *slot = Some(cb);
             }
 
             tray.update(&item)

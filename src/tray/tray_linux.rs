@@ -1,4 +1,4 @@
-use crate::tray::{TrayEvent, TrayItem, TrayMenuItem, TrayToggleType};
+use crate::tray::{TrayEvent, TrayEventCallbackSlot, TrayItem, TrayMenuItem, TrayToggleType};
 use anyhow::{Context as _, Result};
 use gpui::{AsyncApp, MouseButton, Point};
 use std::collections::HashMap;
@@ -11,26 +11,18 @@ const STATUS_NOTIFIER_WATCHER_DESTINATION: &str = "org.kde.StatusNotifierWatcher
 const STATUS_NOTIFIER_ITEM_PATH: &str = "/StatusNotifierItem";
 const DBUS_MENU_PATH: &str = "/MenuBar";
 
-#[derive(Clone)]
-struct Handler {
-    async_app: AsyncApp,
-    callback: Arc<Mutex<Option<Box<dyn FnMut(TrayEvent, &mut gpui::App) + Send + 'static>>>>,
-}
-
-impl Handler {
-    fn dispatch(&self, event: TrayEvent) {
-        let async_app = self.async_app.clone();
-        let callback = self.callback.clone();
-        async_app.update(|cx| {
-            cx.defer(move |cx| {
-                if let Ok(mut slot) = callback.lock() {
-                    if let Some(cb) = slot.as_mut() {
-                        cb(event, cx);
-                    }
-                }
-            });
+fn dispatch_event(async_app: &AsyncApp, callback: &TrayEventCallbackSlot, event: TrayEvent) {
+    let async_app = async_app.clone();
+    let callback = callback.clone();
+    async_app.update(|cx| {
+        cx.defer(move |cx| {
+            if let Ok(mut slot) = callback.lock()
+                && let Some(cb) = slot.as_mut()
+            {
+                cb(event, cx);
+            }
         });
-    }
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -41,7 +33,7 @@ enum LinuxEvent {
     MenuClick(String),
 }
 
-#[derive(Default, Debug, Clone, zbus::zvariant::Type)]
+#[derive(Default, Debug, Clone, zbus::zvariant::Type, serde::Serialize)]
 struct Pixmap {
     width: i32,
     height: i32,
@@ -65,10 +57,11 @@ impl From<Pixmap> for zbus::zvariant::Structure<'_> {
             .add_field(value.height)
             .add_field(value.bytes)
             .build()
+            .expect("valid Pixmap zvariant structure")
     }
 }
 
-#[derive(Debug, Clone, zbus::zvariant::Type)]
+#[derive(Debug, Clone, zbus::zvariant::Type, serde::Serialize)]
 struct ToolTip {
     icon_name: String,
     icon_pixmap: Vec<Pixmap>,
@@ -84,6 +77,7 @@ impl From<ToolTip> for zbus::zvariant::Structure<'_> {
             .add_field(value.title)
             .add_field(value.description)
             .build()
+            .expect("valid ToolTip zvariant structure")
     }
 }
 
@@ -98,7 +92,7 @@ struct LinuxTrayItem {
 }
 
 fn linux_item_from_tray_item(item: TrayItem) -> Result<LinuxTrayItem> {
-    let icon_pixmaps = icon_pixmaps_from_item(&item).unwrap_or_default();
+    let icon_pixmaps = icon_pixmaps_from_item(&item)?.unwrap_or_default();
     let menu = DBusMenu::from_tray_menu_items(&item.submenus);
     Ok(LinuxTrayItem {
         visible: item.visible,
@@ -116,27 +110,62 @@ fn icon_pixmaps_from_item(item: &TrayItem) -> Result<Option<Vec<Pixmap>>> {
     };
 
     let (width, height, bgra) = crate::icon::decode_gpui_image_to_bgra32(icon)?;
-    let data = bgra32_to_argb32(&bgra)?;
-    Ok(Some(vec![Pixmap::new(width as i32, height as i32, data)]))
+    anyhow::ensure!(width > 0 && height > 0, "icon has zero size");
+
+    // Some SNI hosts don't reliably scale very large pixmaps. Provide a few common tray sizes.
+    let sizes: [u32; 4] = [16, 24, 32, 48];
+    let mut pixmaps = Vec::new();
+    for size in sizes {
+        if size > width || size > height {
+            continue;
+        }
+        let scaled = resize_bgra32_nearest(&bgra, width, height, size, size)?;
+        // Although the SNI spec says "ARGB32", many hosts interpret this as native-endian
+        // 0xAARRGGBB pixels (e.g. Qt/cairo ARGB32). On little-endian systems that is
+        // byte-ordered BGRA. GPUI already gives us BGRA8, so pass it through.
+        pixmaps.push(Pixmap::new(size as i32, size as i32, scaled));
+    }
+
+    // Fallback: expose the original size if it's already small.
+    if pixmaps.is_empty() {
+        pixmaps.push(Pixmap::new(width as i32, height as i32, bgra));
+    }
+
+    Ok(Some(pixmaps))
 }
 
-fn bgra32_to_argb32(bgra: &[u8]) -> Result<Vec<u8>> {
+fn resize_bgra32_nearest(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Result<Vec<u8>> {
     anyhow::ensure!(
-        bgra.len() % 4 == 0,
-        "expected BGRA32 byte length multiple of 4"
+        src_w > 0 && src_h > 0 && dst_w > 0 && dst_h > 0,
+        "invalid size"
     );
-    let mut argb = vec![0u8; bgra.len()];
-    for (src, dst) in bgra.chunks_exact(4).zip(argb.chunks_exact_mut(4)) {
-        let b = src[0];
-        let g = src[1];
-        let r = src[2];
-        let a = src[3];
-        dst[0] = a;
-        dst[1] = r;
-        dst[2] = g;
-        dst[3] = b;
+    let src_w = src_w as usize;
+    let src_h = src_h as usize;
+    let dst_w = dst_w as usize;
+    let dst_h = dst_h as usize;
+    anyhow::ensure!(
+        src.len() == src_w * src_h * 4,
+        "expected BGRA32 buffer length {}",
+        src_w * src_h * 4
+    );
+
+    let mut dst = vec![0u8; dst_w * dst_h * 4];
+    for y in 0..dst_h {
+        let sy = y * src_h / dst_h;
+        for x in 0..dst_w {
+            let sx = x * src_w / dst_w;
+            let s = (sy * src_w + sx) * 4;
+            let d = (y * dst_w + x) * 4;
+            dst[d..d + 4].copy_from_slice(&src[s..s + 4]);
+        }
     }
-    Ok(argb)
+    Ok(dst)
 }
 
 #[derive(Debug, Clone)]
@@ -156,17 +185,6 @@ enum MenuProperty {
 }
 
 impl MenuProperty {
-    fn key(&self) -> &'static str {
-        match self {
-            Self::Type(_) => "type",
-            Self::Label(_) => "label",
-            Self::Enabled(_) => "enabled",
-            Self::Visible(_) => "visible",
-            Self::ToggleType(_) => "toggle-type",
-            Self::ToggleState(_) => "toggle-state",
-        }
-    }
-
     fn to_value(&self) -> zbus::zvariant::Value<'static> {
         match self {
             Self::Type(t) => zbus::zvariant::Value::from(*t),
@@ -182,7 +200,7 @@ impl MenuProperty {
     }
 }
 
-#[derive(Default, Debug, Clone, zbus::zvariant::Type)]
+#[derive(Default, Debug, Clone, zbus::zvariant::Type, serde::Serialize)]
 struct DBusMenuLayoutItem {
     id: i32,
     properties: HashMap<String, zbus::zvariant::Value<'static>>,
@@ -196,13 +214,13 @@ impl From<DBusMenuLayoutItem> for zbus::zvariant::Structure<'_> {
             .add_field(value.properties)
             .add_field(value.children)
             .build()
+            .expect("valid DBusMenuLayoutItem zvariant structure")
     }
 }
 
 #[derive(Default, Debug, Clone)]
 struct MenuNode {
     id: i32,
-    parent_id: i32,
     user_id: Option<String>,
     properties: HashMap<&'static str, MenuProperty>,
     children: Vec<i32>,
@@ -216,7 +234,13 @@ struct DBusMenu {
 impl DBusMenu {
     fn new() -> Self {
         let mut nodes = HashMap::new();
-        nodes.insert(0, MenuNode::default());
+        let mut root = MenuNode::default();
+        // Some hosts treat missing properties as false; be explicit.
+        root.properties
+            .insert("enabled", MenuProperty::Enabled(true));
+        root.properties
+            .insert("visible", MenuProperty::Visible(true));
+        nodes.insert(0, root);
         Self { nodes }
     }
 
@@ -235,11 +259,14 @@ impl DBusMenu {
                 let id = next_id;
                 let mut node = MenuNode {
                     id,
-                    parent_id,
                     ..Default::default()
                 };
                 node.properties
                     .insert("type", MenuProperty::Type("separator"));
+                node.properties
+                    .insert("enabled", MenuProperty::Enabled(true));
+                node.properties
+                    .insert("visible", MenuProperty::Visible(true));
                 self.insert_node(parent_id, node);
                 next_id + 1
             }
@@ -252,7 +279,6 @@ impl DBusMenu {
                 let id = next_id;
                 let mut node = MenuNode {
                     id,
-                    parent_id,
                     user_id: Some(user_id.clone()),
                     ..Default::default()
                 };
@@ -260,6 +286,10 @@ impl DBusMenu {
                     .insert("type", MenuProperty::Type("standard"));
                 node.properties
                     .insert("label", MenuProperty::Label(label.clone()));
+                node.properties
+                    .insert("enabled", MenuProperty::Enabled(true));
+                node.properties
+                    .insert("visible", MenuProperty::Visible(true));
 
                 if let Some(toggle) = toggle_type {
                     match toggle {
@@ -358,6 +388,12 @@ struct DBusMenuInterface {
 
 #[zbus::interface(name = "com.canonical.dbusmenu")]
 impl DBusMenuInterface {
+    // libdbusmenu uses Version=4. Some hosts won't populate menus without it.
+    #[zbus(property, name = "Version")]
+    fn version(&self) -> u32 {
+        4
+    }
+
     #[zbus(out_args("revision", "layout"))]
     async fn get_layout(
         &self,
@@ -378,6 +414,53 @@ impl DBusMenuInterface {
         )
     }
 
+    #[zbus(out_args("properties"))]
+    async fn get_group_properties(
+        &self,
+        ids: Vec<i32>,
+        property_names: Vec<String>,
+    ) -> Vec<(i32, HashMap<String, zbus::zvariant::Value<'static>>)> {
+        let menu = self
+            .menu
+            .lock()
+            .ok()
+            .map(|m| m.clone())
+            .unwrap_or_else(DBusMenu::new);
+
+        let include_all = property_names.is_empty();
+        ids.into_iter()
+            .map(|id| {
+                let mut props: HashMap<String, zbus::zvariant::Value<'static>> = HashMap::new();
+                if let Some(node) = menu.nodes.get(&id) {
+                    for (k, v) in &node.properties {
+                        if include_all || property_names.iter().any(|p| p == *k) {
+                            props.insert((*k).to_string(), v.to_value());
+                        }
+                    }
+                }
+                (id, props)
+            })
+            .collect()
+    }
+
+    async fn get_property(&self, id: i32, name: String) -> zbus::zvariant::Value<'static> {
+        let menu = self
+            .menu
+            .lock()
+            .ok()
+            .map(|m| m.clone())
+            .unwrap_or_else(DBusMenu::new);
+
+        if let Some(node) = menu.nodes.get(&id)
+            && let Some(prop) = node.properties.get(name.as_str())
+        {
+            return prop.to_value();
+        }
+
+        // Hosts tend to treat missing properties as "unset"; return an empty string variant.
+        zbus::zvariant::Value::from(String::new())
+    }
+
     async fn event(
         &self,
         id: i32,
@@ -385,11 +468,36 @@ impl DBusMenuInterface {
         _event_data: zbus::zvariant::Value<'_>,
         _timestamp: u32,
     ) {
-        if event_id == "clicked" {
-            let user_id = self.menu.lock().ok().and_then(|m| m.user_id_for_node(id));
-            if let Some(user_id) = user_id {
-                let _ = self.events.send(LinuxEvent::MenuClick(user_id));
-            }
+        self.dispatch_menu_event(id, &event_id);
+    }
+
+    // Some hosts only send click events through EventGroup.
+    async fn event_group(&self, events: Vec<(i32, String, zbus::zvariant::Value<'_>, u32)>) {
+        for (id, event_id, _event_data, _timestamp) in events {
+            self.dispatch_menu_event(id, &event_id);
+        }
+    }
+
+    // Keep click mapping logic in one place so Event and EventGroup behave the same.
+    fn dispatch_menu_event(&self, id: i32, event_id: &str) {
+        let event_id_lower = event_id.to_ascii_lowercase();
+
+        // Different hosts use different event ids for activation.
+        let is_activation = matches!(
+            event_id_lower.as_str(),
+            "clicked" | "activate" | "activated" | "toggled"
+        );
+        if !is_activation {
+            return;
+        }
+
+        if std::env::var_os("GPUI_TRAY_DEBUG").is_some() {
+            eprintln!("dbusmenu click id={id} event_id={event_id}");
+        }
+
+        let user_id = self.menu.lock().ok().and_then(|m| m.user_id_for_node(id));
+        if let Some(user_id) = user_id {
+            let _ = self.events.send(LinuxEvent::MenuClick(user_id));
         }
     }
 
@@ -397,10 +505,9 @@ impl DBusMenuInterface {
         false
     }
 
-    #[zbus::signal(name = "LayoutUpdated")]
+    #[zbus(signal, name = "LayoutUpdated")]
     async fn layout_updated(
-        &self,
-        cx: &zbus::object_server::SignalContext<'_>,
+        emitter: &zbus::object_server::SignalEmitter<'_>,
         revision: u32,
         parent: i32,
     ) -> zbus::Result<()>;
@@ -454,7 +561,9 @@ impl StatusNotifierItemInterface {
 
     #[zbus(property, name = "IconName")]
     fn icon_name(&self) -> String {
-        String::new()
+        // Fallback for hosts that ignore IconPixmap or misinterpret its byte order.
+        // This should exist in standard icon themes.
+        "application-x-executable".to_string()
     }
 
     #[zbus(property, name = "IconPixmap")]
@@ -504,24 +613,23 @@ impl StatusNotifierItemInterface {
         let _ = self.events.send(LinuxEvent::Scroll(delta, orientation));
     }
 
-    #[zbus::signal(name = "NewTitle")]
-    async fn new_title(&self, cx: &zbus::object_server::SignalContext<'_>) -> zbus::Result<()>;
+    #[zbus(signal, name = "NewTitle")]
+    async fn new_title(emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
 
-    #[zbus::signal(name = "NewIcon")]
-    async fn new_icon(&self, cx: &zbus::object_server::SignalContext<'_>) -> zbus::Result<()>;
+    #[zbus(signal, name = "NewIcon")]
+    async fn new_icon(emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
 
-    #[zbus::signal(name = "NewToolTip")]
-    async fn new_tooltip(&self, cx: &zbus::object_server::SignalContext<'_>) -> zbus::Result<()>;
+    #[zbus(signal, name = "NewToolTip")]
+    async fn new_tooltip(emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
 
-    #[zbus::signal(name = "NewStatus")]
+    #[zbus(signal, name = "NewStatus")]
     async fn new_status(
-        &self,
-        cx: &zbus::object_server::SignalContext<'_>,
+        emitter: &zbus::object_server::SignalEmitter<'_>,
         status: String,
     ) -> zbus::Result<()>;
 
-    #[zbus::signal(name = "NewMenu")]
-    async fn new_menu(&self, cx: &zbus::object_server::SignalContext<'_>) -> zbus::Result<()>;
+    #[zbus(signal, name = "NewMenu")]
+    async fn new_menu(emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
 }
 
 enum Command {
@@ -529,7 +637,7 @@ enum Command {
 }
 
 struct LinuxTrayHandle {
-    handler: Handler,
+    callback: TrayEventCallbackSlot,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<Command>,
 }
 
@@ -550,22 +658,16 @@ fn make_bus_name() -> String {
 }
 
 async fn register_with_watcher(connection: &zbus::Connection, service: &str) -> zbus::Result<()> {
-    let proxy: zbus::Proxy = zbus::ProxyBuilder::new(connection)
-        .interface(STATUS_NOTIFIER_WATCHER_INTERFACE)?
-        .path(STATUS_NOTIFIER_WATCHER_PATH)?
-        .destination(STATUS_NOTIFIER_WATCHER_DESTINATION)?
-        .build()
-        .await?;
+    let proxy = zbus::Proxy::new(
+        connection,
+        STATUS_NOTIFIER_WATCHER_DESTINATION,
+        STATUS_NOTIFIER_WATCHER_PATH,
+        STATUS_NOTIFIER_WATCHER_INTERFACE,
+    )
+    .await?;
 
     proxy
-        .connection()
-        .call_method(
-            Some(STATUS_NOTIFIER_WATCHER_DESTINATION),
-            STATUS_NOTIFIER_WATCHER_PATH,
-            Some(STATUS_NOTIFIER_WATCHER_INTERFACE),
-            "RegisterStatusNotifierItem",
-            &(service),
-        )
+        .call_method("RegisterStatusNotifierItem", &(service))
         .await?;
     Ok(())
 }
@@ -576,10 +678,6 @@ pub fn set_up_tray(_cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem)
     }
 
     let callback = Arc::new(Mutex::new(item.event.take()));
-    let handler = Handler {
-        async_app,
-        callback,
-    };
 
     let linux_item = linux_item_from_tray_item(item)?;
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
@@ -601,20 +699,16 @@ pub fn set_up_tray(_cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem)
     // Store handle before spawning so sync_tray can send updates immediately after setup.
     LINUX_TRAY
         .set(LinuxTrayHandle {
-            handler: handler.clone(),
+            callback: callback.clone(),
             cmd_tx: cmd_tx.clone(),
         })
         .map_err(|_| anyhow::anyhow!("tray storage already initialized"))?;
 
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build();
-        let Ok(rt) = rt else {
-            return;
-        };
-
-        rt.block_on(async move {
+    async_app
+        .spawn(move |cx: &mut AsyncApp| {
+        let async_app = cx.clone();
+        let callback = callback.clone();
+        async move {
             let service = make_bus_name();
 
             let status_iface = StatusNotifierItemInterface {
@@ -628,7 +722,7 @@ pub fn set_up_tray(_cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem)
                 events: event_tx.clone(),
             };
 
-            let builder = zbus::ConnectionBuilder::session();
+            let builder = zbus::connection::Builder::session();
             let Ok(builder) = builder else {
                 return;
             };
@@ -685,22 +779,29 @@ pub fn set_up_tray(_cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem)
                                 let rev = revision.fetch_add(1, Ordering::Relaxed).saturating_add(1);
 
                                 if let Some(status_ref) = status_ref.as_ref() {
-                                    if let Ok(cx) = status_ref.signal_context().await {
-                                        let _ = StatusNotifierItemInterface::new_title(status_ref, &cx).await;
-                                        let _ = StatusNotifierItemInterface::new_icon(status_ref, &cx).await;
-                                        let _ = StatusNotifierItemInterface::new_tooltip(status_ref, &cx).await;
-                                        let _ = StatusNotifierItemInterface::new_status(status_ref, &cx, {
-                                            let visible = state.lock().ok().map(|s| s.visible).unwrap_or(true);
-                                            if visible { "Active".to_string() } else { "Passive".to_string() }
-                                        }).await;
-                                        let _ = StatusNotifierItemInterface::new_menu(status_ref, &cx).await;
-                                    }
+                                    let emitter = status_ref.signal_emitter();
+                                    let _ = StatusNotifierItemInterface::new_title(emitter).await;
+                                    let _ = StatusNotifierItemInterface::new_icon(emitter).await;
+                                    let _ = StatusNotifierItemInterface::new_tooltip(emitter).await;
+                                    let _ = StatusNotifierItemInterface::new_status(
+                                        emitter,
+                                        {
+                                            let visible =
+                                                state.lock().ok().map(|s| s.visible).unwrap_or(true);
+                                            if visible {
+                                                "Active".to_string()
+                                            } else {
+                                                "Passive".to_string()
+                                            }
+                                        },
+                                    )
+                                    .await;
+                                    let _ = StatusNotifierItemInterface::new_menu(emitter).await;
                                 }
 
                                 if let Some(menu_ref) = menu_ref.as_ref() {
-                                    if let Ok(cx) = menu_ref.signal_context().await {
-                                        let _ = DBusMenuInterface::layout_updated(menu_ref, &cx, rev, 0).await;
-                                    }
+                                    let emitter = menu_ref.signal_emitter();
+                                    let _ = DBusMenuInterface::layout_updated(emitter, rev, 0).await;
                                 }
                             }
                         }
@@ -726,13 +827,14 @@ pub fn set_up_tray(_cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem)
                             }
                             LinuxEvent::MenuClick(id) => TrayEvent::MenuClick { id },
                         };
-                        handler.dispatch(event);
+                        dispatch_event(&async_app, &callback, event);
                     }
                     else => break,
                 }
             }
-        });
-    });
+        }
+    })
+    .detach();
 
     // Push initial state through the same codepath (signals/layout update).
     let _ = cmd_tx.send(Command::Update(linux_item));
@@ -745,10 +847,10 @@ pub fn sync_tray(_cx: &mut gpui::App, mut item: TrayItem) -> Result<()> {
     };
 
     // Replace callback if provided.
-    if let Some(cb) = item.event.take() {
-        if let Ok(mut slot) = handle.handler.callback.lock() {
-            *slot = Some(cb);
-        }
+    if let Some(cb) = item.event.take()
+        && let Ok(mut slot) = handle.callback.lock()
+    {
+        *slot = Some(cb);
     }
 
     let linux_item =

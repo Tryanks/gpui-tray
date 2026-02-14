@@ -1,4 +1,4 @@
-use crate::tray::{TrayEvent, TrayItem, TrayMenuItem, TrayToggleType};
+use crate::tray::{TrayEvent, TrayEventCallbackSlot, TrayItem, TrayMenuItem, TrayToggleType};
 use anyhow::{Context as _, Result};
 use gpui::{AsyncApp, MouseButton, Point};
 use std::{
@@ -42,7 +42,7 @@ const WM_TRAY_OPEN_MENU: u32 = WM_USER + 2;
 #[derive(Clone)]
 struct Handler {
     async_app: AsyncApp,
-    callback: Arc<Mutex<Option<Box<dyn FnMut(TrayEvent, &mut gpui::App) + Send + 'static>>>>,
+    callback: TrayEventCallbackSlot,
     id_to_menu_id: Arc<Mutex<HashMap<u16, String>>>,
 }
 
@@ -52,10 +52,10 @@ impl Handler {
         let callback = self.callback.clone();
         async_app.update(|cx| {
             cx.defer(move |cx| {
-                if let Ok(mut slot) = callback.lock() {
-                    if let Some(cb) = slot.as_mut() {
-                        cb(event, cx);
-                    }
+                if let Ok(mut slot) = callback.lock()
+                    && let Some(cb) = slot.as_mut()
+                {
+                    cb(event, cx);
                 }
             });
         });
