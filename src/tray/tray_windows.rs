@@ -10,8 +10,9 @@ use std::{
     ptr,
     sync::{Arc, Mutex, OnceLock},
 };
+use windows_sys::core::BOOL;
 use windows_sys::Win32::{
-    Foundation::{BOOL, HMODULE, HWND, LPARAM, LRESULT, POINT as WIN_POINT, WPARAM},
+    Foundation::{HMODULE, HWND, LPARAM, LRESULT, POINT as WIN_POINT, WPARAM},
     Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
         DeleteObject,
@@ -86,15 +87,15 @@ impl Drop for Tray {
     fn drop(&mut self) {
         unsafe {
             let _ = self.delete_icon();
-            if self.hicon_owned && self.hicon != 0 {
+            if self.hicon_owned && self.hicon != ptr::null_mut() {
                 DestroyIcon(self.hicon);
-                self.hicon = 0;
+                self.hicon = ptr::null_mut();
                 self.hicon_owned = false;
             }
-            if self.hwnd != 0 {
+            if self.hwnd != ptr::null_mut() {
                 DestroyWindow(self.hwnd);
             }
-            if self.menu != 0 {
+            if self.menu != ptr::null_mut() {
                 DestroyMenu(self.menu);
             }
         }
@@ -221,9 +222,9 @@ fn register_window_class(instance: HMODULE) -> Result<()> {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
-            hIcon: 0,
-            hCursor: LoadCursorW(0, IDC_ARROW),
-            hbrBackground: 0,
+            hIcon: ptr::null_mut(),
+            hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
+            hbrBackground: ptr::null_mut(),
             lpszMenuName: ptr::null(),
             lpszClassName: class_name().as_ptr(),
         };
@@ -246,10 +247,10 @@ impl Tray {
         data.uFlags = NIF_MESSAGE | NIF_TIP | NIF_ICON;
         data.uCallbackMessage = TRAY_CALLBACK_MESSAGE;
 
-        data.hIcon = if self.hicon != 0 {
+        data.hIcon = if self.hicon != ptr::null_mut() {
             self.hicon
         } else {
-            LoadIconW(0, IDI_APPLICATION)
+            LoadIconW(ptr::null_mut(), IDI_APPLICATION)
         };
 
         let tooltip_wide = to_wide_null(item.tooltip.as_str());
@@ -315,10 +316,10 @@ impl Tray {
     unsafe fn set_icon(&mut self, icon: Option<&gpui::Image>) -> Result<()> {
         let (width, height, bgra) = match icon {
             None => {
-                if self.hicon_owned && self.hicon != 0 {
+                if self.hicon_owned && self.hicon != ptr::null_mut() {
                     DestroyIcon(self.hicon);
                 }
-                self.hicon = 0;
+                self.hicon = ptr::null_mut();
                 self.hicon_owned = false;
                 return Ok(());
             }
@@ -327,7 +328,7 @@ impl Tray {
         };
 
         let new_hicon = hicon_from_bgra32(width, height, &bgra)?;
-        if self.hicon_owned && self.hicon != 0 {
+        if self.hicon_owned && self.hicon != ptr::null_mut() {
             DestroyIcon(self.hicon);
         }
         self.hicon = new_hicon;
@@ -336,12 +337,12 @@ impl Tray {
     }
 
     unsafe fn rebuild_menu(&mut self, items: &[TrayMenuItem]) -> Result<()> {
-        if self.menu != 0 {
+        if self.menu != ptr::null_mut() {
             DestroyMenu(self.menu);
         }
 
         let menu = CreatePopupMenu();
-        (menu != 0)
+        (menu != ptr::null_mut())
             .then_some(())
             .context("CreatePopupMenu failed")?;
 
@@ -359,7 +360,8 @@ impl Tray {
     }
 
     unsafe fn sync(&mut self, item: TrayItem) -> Result<()> {
-        if let Some(cb) = item.event {
+        let mut item = item;
+        if let Some(cb) = item.event.take() {
             if let Ok(mut slot) = self.handler.callback.lock() {
                 *slot = Some(cb);
             }
@@ -411,8 +413,15 @@ unsafe fn hicon_from_bgra32(width: u32, height: u32, bgra: &[u8]) -> Result<HICO
     };
 
     let mut bits_ptr: *mut core::ffi::c_void = ptr::null_mut();
-    let color_bmp = CreateDIBSection(0, &bmi, DIB_RGB_COLORS, &mut bits_ptr, 0, 0);
-    anyhow::ensure!(color_bmp != 0, "CreateDIBSection failed");
+    let color_bmp = CreateDIBSection(
+        ptr::null_mut(),
+        &bmi,
+        DIB_RGB_COLORS,
+        &mut bits_ptr,
+        ptr::null_mut(),
+        0,
+    );
+    anyhow::ensure!(color_bmp != ptr::null_mut(), "CreateDIBSection failed");
     anyhow::ensure!(
         !bits_ptr.is_null(),
         "CreateDIBSection returned null bits pointer"
@@ -429,7 +438,7 @@ unsafe fn hicon_from_bgra32(width: u32, height: u32, bgra: &[u8]) -> Result<HICO
         1,
         mask_bytes.as_ptr().cast(),
     );
-    anyhow::ensure!(mask_bmp != 0, "CreateBitmap(mask) failed");
+    anyhow::ensure!(mask_bmp != ptr::null_mut(), "CreateBitmap(mask) failed");
 
     let mut ii: ICONINFO = mem::zeroed();
     ii.fIcon = 1;
@@ -443,7 +452,7 @@ unsafe fn hicon_from_bgra32(width: u32, height: u32, bgra: &[u8]) -> Result<HICO
     let _ = DeleteObject(color_bmp);
     let _ = DeleteObject(mask_bmp);
 
-    anyhow::ensure!(hicon != 0, "CreateIconIndirect failed");
+    anyhow::ensure!(hicon != ptr::null_mut(), "CreateIconIndirect failed");
     Ok(hicon)
 }
 
@@ -455,7 +464,10 @@ unsafe fn append_tray_menu_item(
 ) -> Result<()> {
     match item {
         TrayMenuItem::Separator { .. } => {
-            let _: BOOL = AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+            let ok: BOOL = AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+            if ok == 0 {
+                anyhow::bail!("AppendMenuW(MF_SEPARATOR) failed")
+            }
         }
         TrayMenuItem::Submenu {
             id,
@@ -480,10 +492,13 @@ unsafe fn append_tray_menu_item(
                 };
                 flags |= if checked { MF_CHECKED } else { MF_UNCHECKED };
 
-                let _: BOOL = AppendMenuW(menu, flags, cmd as usize, label_w.as_ptr());
+                let ok: BOOL = AppendMenuW(menu, flags, cmd as usize, label_w.as_ptr());
+                if ok == 0 {
+                    anyhow::bail!("AppendMenuW(menu item) failed")
+                }
             } else {
                 let submenu = CreatePopupMenu();
-                (submenu != 0)
+                (submenu != ptr::null_mut())
                     .then_some(())
                     .context("CreatePopupMenu(submenu) failed")?;
                 for child in children {
@@ -491,7 +506,10 @@ unsafe fn append_tray_menu_item(
                 }
 
                 let label_w = to_wide_null(label);
-                let _: BOOL = AppendMenuW(menu, MF_POPUP, submenu as usize, label_w.as_ptr());
+                let ok: BOOL = AppendMenuW(menu, MF_POPUP, submenu as usize, label_w.as_ptr());
+                if ok == 0 {
+                    anyhow::bail!("AppendMenuW(submenu) failed")
+                }
             }
         }
     }
@@ -501,7 +519,7 @@ unsafe fn append_tray_menu_item(
 
 pub fn set_up_tray(cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem) -> Result<()> {
     let instance = unsafe { GetModuleHandleW(ptr::null()) };
-    (instance != 0)
+    (instance != ptr::null_mut())
         .then_some(())
         .context("GetModuleHandleW failed")?;
 
@@ -524,15 +542,17 @@ pub fn set_up_tray(cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem) 
         };
 
         let menu = unsafe { CreatePopupMenu() };
-        (menu != 0)
+        (menu != ptr::null_mut())
             .then_some(())
             .context("CreatePopupMenu failed")?;
 
         let mut tray = Box::new(Tray {
             handler,
-            hwnd: 0,
+            hwnd: ptr::null_mut(),
             menu,
             icon_added: false,
+            hicon: ptr::null_mut(),
+            hicon_owned: false,
         });
 
         unsafe {
@@ -545,12 +565,12 @@ pub fn set_up_tray(cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem) 
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                0,
-                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
                 instance,
-                tray.as_mut() as *mut Tray as *mut _,
+                tray.as_mut() as *mut Tray as *const _,
             );
-            (hwnd != 0)
+            (hwnd != ptr::null_mut())
                 .then_some(())
                 .context("CreateWindowExW failed")?;
             tray.hwnd = hwnd;
