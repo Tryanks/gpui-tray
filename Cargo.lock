@@ -2169,7 +2169,6 @@ name = "gpui-tray"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "core-text",
  "gpui",
  "gpui_platform",
  "objc2",
