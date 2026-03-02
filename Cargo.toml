@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0"

@@ -153,7 +153,7 @@ fn sync_tray(cx: &mut App) {
 }
 
 fn main() -> anyhow::Result<()> {
-    Application::new()
+    gpui_platform::application()
         .with_quit_mode(QuitMode::Explicit)
         .run(|cx: &mut App| {
             cx.set_global(AppState::new());
