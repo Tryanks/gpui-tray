@@ -1,6 +1,6 @@
 use gpui::{
-    App, Application, Context, Div, Global, Menu, MenuItem, QuitMode, SharedString, Stateful,
-    Window, WindowOptions, actions, div, prelude::*,
+    App, Context, Div, Global, Menu, MenuItem, QuitMode, SharedString, Stateful, Window,
+    WindowOptions, actions, div, prelude::*,
 };
 use gpui_tray::{TrayEvent, TrayItem, TrayMenuItem};
 
@@ -153,7 +153,7 @@ fn sync_tray(cx: &mut App) {
 }
 
 fn main() -> anyhow::Result<()> {
-    Application::new()
+    gpui_platform::application()
         .with_quit_mode(QuitMode::Explicit)
         .run(|cx: &mut App| {
         cx.set_global(AppState::new());
