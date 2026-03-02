@@ -153,48 +153,46 @@ fn sync_tray(cx: &mut App) {
 }
 
 fn main() -> anyhow::Result<()> {
-    gpui_platform::application()
+    Application::new()
         .with_quit_mode(QuitMode::Explicit)
         .run(|cx: &mut App| {
-            cx.set_global(AppState::new());
+        cx.set_global(AppState::new());
 
-            // Ensure macOS shows our app's menu bar when our window is frontmost.
-            cx.set_menus(vec![Menu {
-                name: "tray_demo".into(),
-                items: vec![MenuItem::action("Quit", Quit)],
-            }]);
+        // Ensure macOS shows our app's menu bar when our window is frontmost.
+        cx.set_menus(vec![Menu {
+            name: "tray_demo".into(),
+            items: vec![MenuItem::action("Quit", Quit)],
+        }]);
 
-            cx.activate(true);
-            cx.on_action(quit);
-            cx.on_action(toggle_check);
-            cx.on_action(toggle_visible);
-            cx.on_action(hide_window);
-            cx.on_action(show_window);
+        cx.activate(true);
+        cx.on_action(quit);
+        cx.on_action(toggle_check);
+        cx.on_action(toggle_visible);
+        cx.on_action(hide_window);
+        cx.on_action(show_window);
 
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    #[cfg(target_os = "macos")]
-                    {
-                        if let Err(error) = set_shows_in_dock(false) {
-                            eprintln!("failed to hide Dock icon: {error:#}");
-                        }
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                #[cfg(target_os = "macos")]
+                {
+                    if let Err(error) = set_shows_in_dock(false) {
+                        eprintln!("failed to hide Dock icon: {error:#}");
                     }
                 }
-            })
-            .detach();
-
-            if let Err(error) =
-                cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| Example))
-            {
-                eprintln!("failed to open window: {error:#}");
             }
+        })
+        .detach();
 
-            let async_app = cx.to_async();
-            let item = build_tray_item(cx.global::<AppState>()).on_event(on_tray_event);
-            if let Err(error) = gpui_tray::tray::set_up_tray(cx, async_app, item) {
-                eprintln!("failed to set up tray: {error:#}");
-            }
-        });
+        if let Err(error) = cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| Example)) {
+            eprintln!("failed to open window: {error:#}");
+        }
+
+        let async_app = cx.to_async();
+        let item = build_tray_item(cx.global::<AppState>()).on_event(on_tray_event);
+        if let Err(error) = gpui_tray::tray::set_up_tray(cx, async_app, item) {
+            eprintln!("failed to set up tray: {error:#}");
+        }
+    });
 
     Ok(())
 }
