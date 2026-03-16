@@ -1,4 +1,7 @@
-use crate::tray::{TrayEvent, TrayEventCallbackSlot, TrayItem, TrayMenuItem, TrayToggleType};
+use crate::tray::{
+    TrayClickAction, TrayClickKind, TrayClickPolicy, TrayEvent, TrayEventCallbackSlot, TrayItem,
+    TrayMenuItem, TrayToggleType,
+};
 use anyhow::{Context as _, Result};
 use gpui::{AsyncApp, MouseButton, Point};
 use std::collections::HashMap;
@@ -89,6 +92,7 @@ struct LinuxTrayItem {
     description: String,
     icon_pixmaps: Vec<Pixmap>,
     menu: DBusMenu,
+    click_policy: TrayClickPolicy,
 }
 
 fn linux_item_from_tray_item(item: TrayItem) -> Result<LinuxTrayItem> {
@@ -101,6 +105,7 @@ fn linux_item_from_tray_item(item: TrayItem) -> Result<LinuxTrayItem> {
         description: item.description,
         icon_pixmaps,
         menu,
+        click_policy: item.click_policy,
     })
 }
 
@@ -255,7 +260,7 @@ impl DBusMenu {
 
     fn add_item(&mut self, parent_id: i32, item: &TrayMenuItem, next_id: i32) -> i32 {
         match item {
-            TrayMenuItem::Separator { .. } => {
+            TrayMenuItem::Separator { visible, .. } => {
                 let id = next_id;
                 let mut node = MenuNode {
                     id,
@@ -266,20 +271,23 @@ impl DBusMenu {
                 node.properties
                     .insert("enabled", MenuProperty::Enabled(true));
                 node.properties
-                    .insert("visible", MenuProperty::Visible(true));
+                    .insert("visible", MenuProperty::Visible(*visible));
                 self.insert_node(parent_id, node);
                 next_id + 1
             }
             TrayMenuItem::Submenu {
-                id: user_id,
                 label,
+                id: _,
+                enabled,
+                visible,
+                role: _,
                 toggle_type,
                 children,
             } => {
                 let id = next_id;
                 let mut node = MenuNode {
                     id,
-                    user_id: Some(user_id.clone()),
+                    user_id: item.menu_event_id().map(str::to_owned),
                     ..Default::default()
                 };
                 node.properties
@@ -287,9 +295,9 @@ impl DBusMenu {
                 node.properties
                     .insert("label", MenuProperty::Label(label.clone()));
                 node.properties
-                    .insert("enabled", MenuProperty::Enabled(true));
+                    .insert("enabled", MenuProperty::Enabled(*enabled));
                 node.properties
-                    .insert("visible", MenuProperty::Visible(true));
+                    .insert("visible", MenuProperty::Visible(*visible));
 
                 if let Some(toggle) = toggle_type {
                     match toggle {
@@ -692,6 +700,7 @@ pub fn set_up_tray(_cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem)
         tooltip: linux_item.tooltip.clone(),
         description: linux_item.description.clone(),
     }));
+    let click_policy = Arc::new(Mutex::new(linux_item.click_policy));
 
     let menu = Arc::new(Mutex::new(linux_item.menu.clone()));
     let revision = Arc::new(AtomicU32::new(1));
@@ -706,9 +715,10 @@ pub fn set_up_tray(_cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem)
 
     async_app
         .spawn(move |cx: &mut AsyncApp| {
-        let async_app = cx.clone();
-        let callback = callback.clone();
-        async move {
+            let async_app = cx.clone();
+            let callback = callback.clone();
+            let click_policy = click_policy.clone();
+            async move {
             let service = make_bus_name();
 
             let status_iface = StatusNotifierItemInterface {
@@ -773,6 +783,9 @@ pub fn set_up_tray(_cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem)
                                     s.tooltip = update.tooltip;
                                     s.description = update.description;
                                 }
+                                if let Ok(mut policy) = click_policy.lock() {
+                                    *policy = update.click_policy;
+                                }
                                 if let Ok(mut m) = menu.lock() {
                                     *m = update.menu;
                                 }
@@ -807,15 +820,20 @@ pub fn set_up_tray(_cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem)
                         }
                     }
                     Some(ev) = event_rx.recv() => {
+                        let policy = click_policy.lock().ok().map(|policy| *policy).unwrap_or_default();
                         let event = match ev {
-                            LinuxEvent::Activate(x,y) => TrayEvent::TrayClick{
-                                button: MouseButton::Left,
-                                position: Point { x, y },
-                            },
-                            LinuxEvent::SecondaryActivate(x,y) => TrayEvent::TrayClick{
-                                button: MouseButton::Middle,
-                                position: Point { x, y },
-                            },
+                            LinuxEvent::Activate(x,y) => map_click_event(
+                                policy.left,
+                                MouseButton::Left,
+                                TrayClickKind::Single,
+                                Point { x, y },
+                            ),
+                            LinuxEvent::SecondaryActivate(x,y) => map_click_event(
+                                policy.right,
+                                MouseButton::Right,
+                                TrayClickKind::Single,
+                                Point { x, y },
+                            ),
                             LinuxEvent::Scroll(delta, orientation) => {
                                 let o = orientation.to_ascii_lowercase();
                                 let scroll_detal = if o.contains("horizontal") {
@@ -823,11 +841,13 @@ pub fn set_up_tray(_cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem)
                                 } else {
                                     Point { x: 0, y: delta }
                                 };
-                                TrayEvent::Scroll { scroll_detal }
+                                Some(TrayEvent::Scroll { scroll_detal })
                             }
-                            LinuxEvent::MenuClick(id) => TrayEvent::MenuClick { id },
+                            LinuxEvent::MenuClick(id) => Some(TrayEvent::MenuClick { id }),
                         };
-                        dispatch_event(&async_app, &callback, event);
+                        if let Some(event) = event {
+                            dispatch_event(&async_app, &callback, event);
+                        }
                     }
                     else => break,
                 }
@@ -857,4 +877,20 @@ pub fn sync_tray(_cx: &mut gpui::App, mut item: TrayItem) -> Result<()> {
         linux_item_from_tray_item(item).context("failed to build linux tray payload")?;
     let _ = handle.cmd_tx.send(Command::Update(linux_item));
     Ok(())
+}
+
+fn map_click_event(
+    action: TrayClickAction,
+    button: MouseButton,
+    kind: TrayClickKind,
+    position: Point<i32>,
+) -> Option<TrayEvent> {
+    match action {
+        TrayClickAction::EmitEvent => Some(TrayEvent::TrayClick {
+            button,
+            kind,
+            position,
+        }),
+        TrayClickAction::OpenMenu | TrayClickAction::Ignore => None,
+    }
 }

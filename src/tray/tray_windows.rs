@@ -1,4 +1,7 @@
-use crate::tray::{TrayEvent, TrayEventCallbackSlot, TrayItem, TrayMenuItem, TrayToggleType};
+use crate::tray::{
+    TrayClickAction, TrayClickKind, TrayClickPolicy, TrayEvent, TrayEventCallbackSlot, TrayItem,
+    TrayMenuItem, TrayToggleType,
+};
 use anyhow::{Context as _, Result};
 use gpui::{AsyncApp, MouseButton, Point};
 use std::{
@@ -10,7 +13,6 @@ use std::{
     ptr,
     sync::{Arc, Mutex, OnceLock},
 };
-use windows_sys::core::BOOL;
 use windows_sys::Win32::{
     Foundation::{HMODULE, HWND, LPARAM, LRESULT, POINT as WIN_POINT, WPARAM},
     Graphics::Gdi::{
@@ -27,18 +29,22 @@ use windows_sys::Win32::{
             AppendMenuW, CREATESTRUCTW, CW_USEDEFAULT, CreateIconIndirect, CreatePopupMenu,
             CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, GetCursorPos,
             HICON, HMENU, ICONINFO, IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, MF_CHECKED,
-            MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW, PostQuitMessage,
-            RegisterClassW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD,
-            TPM_RIGHTBUTTON, TrackPopupMenu, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY,
-            WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NULL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-            WM_USER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            MF_DISABLED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW,
+            PostQuitMessage, RegisterClassW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+            TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE,
+            WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NULL, WM_RBUTTONDOWN,
+            WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
         },
     },
 };
+use windows_sys::core::BOOL;
 
 // Tray callback must be in WM_USER..0x7FFF per Shell_NotifyIconW requirements.
 const TRAY_CALLBACK_MESSAGE: u32 = WM_USER + 1;
 const WM_TRAY_OPEN_MENU: u32 = WM_USER + 2;
+const TRAY_CLICK_LEFT_SINGLE: usize = 0;
+const TRAY_CLICK_RIGHT_SINGLE: usize = 1;
+const TRAY_CLICK_LEFT_DOUBLE: usize = 2;
 
 #[derive(Clone)]
 struct Handler {
@@ -78,6 +84,7 @@ struct Tray {
     handler: Handler,
     hwnd: HWND,
     menu: HMENU,
+    click_policy: TrayClickPolicy,
     icon_added: bool,
     hicon: HICON,
     hicon_owned: bool,
@@ -144,14 +151,12 @@ unsafe extern "system" fn wndproc(
         }
         TRAY_CALLBACK_MESSAGE => {
             let event = (lparam as u32) & 0xFFFF;
-            if event == WM_RBUTTONUP || event == WM_RBUTTONDOWN || event == WM_CONTEXTMENU {
-                let _ = PostMessageW(hwnd, WM_TRAY_OPEN_MENU, 0, 0);
-            } else if event == WM_LBUTTONUP
-                || event == WM_LBUTTONDOWN
-                || event == WM_LBUTTONDBLCLK
-                || event == NIN_SELECT
-            {
-                let _ = PostMessageW(hwnd, WM_TRAY_OPEN_MENU, 1, 0);
+            if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
+                let _ = PostMessageW(hwnd, WM_TRAY_OPEN_MENU, TRAY_CLICK_RIGHT_SINGLE, 0);
+            } else if event == WM_LBUTTONUP || event == NIN_SELECT {
+                let _ = PostMessageW(hwnd, WM_TRAY_OPEN_MENU, TRAY_CLICK_LEFT_SINGLE, 0);
+            } else if event == WM_LBUTTONDBLCLK {
+                let _ = PostMessageW(hwnd, WM_TRAY_OPEN_MENU, TRAY_CLICK_LEFT_DOUBLE, 0);
             }
             0
         }
@@ -159,37 +164,7 @@ unsafe extern "system" fn wndproc(
             let Some(tray) = tray_from_window(hwnd) else {
                 return 0;
             };
-
-            let mut point = WIN_POINT { x: 0, y: 0 };
-            let _ = GetCursorPos(&mut point);
-
-            if wparam == 1 {
-                tray.handler.dispatch(TrayEvent::TrayClick {
-                    button: MouseButton::Left,
-                    position: Point {
-                        x: point.x,
-                        y: point.y,
-                    },
-                });
-                return 0;
-            }
-
-            let _ = SetForegroundWindow(hwnd);
-            let command = TrackPopupMenu(
-                tray.menu,
-                TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                point.x,
-                point.y,
-                0,
-                hwnd,
-                ptr::null(),
-            );
-
-            if command != 0 {
-                let _ = PostMessageW(hwnd, WM_COMMAND, command as usize, 0);
-            }
-            let _ = PostMessageW(hwnd, WM_NULL, 0, 0);
-
+            tray.handle_click(wparam);
             0
         }
         WM_COMMAND => {
@@ -239,6 +214,61 @@ fn register_window_class(instance: HMODULE) -> Result<()> {
 }
 
 impl Tray {
+    unsafe fn handle_click(&self, click_code: usize) {
+        let mut point = WIN_POINT { x: 0, y: 0 };
+        let _ = GetCursorPos(&mut point);
+
+        let (action, button, kind) = match click_code {
+            TRAY_CLICK_LEFT_SINGLE => (
+                self.click_policy.left,
+                MouseButton::Left,
+                TrayClickKind::Single,
+            ),
+            TRAY_CLICK_RIGHT_SINGLE => (
+                self.click_policy.right,
+                MouseButton::Right,
+                TrayClickKind::Single,
+            ),
+            TRAY_CLICK_LEFT_DOUBLE => (
+                self.click_policy.double_click,
+                MouseButton::Left,
+                TrayClickKind::Double,
+            ),
+            _ => return,
+        };
+
+        match action {
+            TrayClickAction::EmitEvent => {
+                self.handler.dispatch(TrayEvent::TrayClick {
+                    button,
+                    kind,
+                    position: Point {
+                        x: point.x,
+                        y: point.y,
+                    },
+                });
+            }
+            TrayClickAction::OpenMenu => {
+                let _ = SetForegroundWindow(self.hwnd);
+                let command = TrackPopupMenu(
+                    self.menu,
+                    TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                    point.x,
+                    point.y,
+                    0,
+                    self.hwnd,
+                    ptr::null(),
+                );
+
+                if command != 0 {
+                    let _ = PostMessageW(self.hwnd, WM_COMMAND, command as usize, 0);
+                }
+                let _ = PostMessageW(self.hwnd, WM_NULL, 0, 0);
+            }
+            TrayClickAction::Ignore => {}
+        }
+    }
+
     unsafe fn notify_data(&self, item: &TrayItem) -> NOTIFYICONDATAW {
         let mut data: NOTIFYICONDATAW = mem::zeroed();
         data.cbSize = mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -366,6 +396,7 @@ impl Tray {
                 *slot = Some(cb);
             }
         }
+        self.click_policy = item.click_policy;
 
         self.rebuild_menu(&item.submenus)?;
 
@@ -463,26 +494,30 @@ unsafe fn append_tray_menu_item(
     next_id: &mut u16,
 ) -> Result<()> {
     match item {
-        TrayMenuItem::Separator { .. } => {
+        TrayMenuItem::Separator { visible, .. } => {
+            if !*visible {
+                return Ok(());
+            }
             let ok: BOOL = AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
             if ok == 0 {
                 anyhow::bail!("AppendMenuW(MF_SEPARATOR) failed")
             }
         }
         TrayMenuItem::Submenu {
-            id,
+            id: _,
             label,
+            enabled,
+            visible,
+            role: _,
             toggle_type,
             children,
         } => {
+            if !*visible {
+                return Ok(());
+            }
+
+            let item_id = item.menu_event_id().map(str::to_owned);
             if children.is_empty() {
-                let cmd = *next_id;
-                *next_id = next_id.wrapping_add(1).max(1000);
-
-                if let Ok(mut map) = id_to_menu_id.lock() {
-                    map.insert(cmd, id.clone());
-                }
-
                 let label_w = to_wide_null(label);
                 let mut flags = MF_STRING;
                 let checked = match toggle_type {
@@ -491,8 +526,23 @@ unsafe fn append_tray_menu_item(
                     None => false,
                 };
                 flags |= if checked { MF_CHECKED } else { MF_UNCHECKED };
+                if !*enabled {
+                    flags |= MF_DISABLED;
+                }
 
-                let ok: BOOL = AppendMenuW(menu, flags, cmd as usize, label_w.as_ptr());
+                let cmd = if let Some(item_id) = item_id {
+                    let cmd = *next_id;
+                    *next_id = next_id.wrapping_add(1).max(1000);
+
+                    if let Ok(mut map) = id_to_menu_id.lock() {
+                        map.insert(cmd, item_id);
+                    }
+                    cmd as usize
+                } else {
+                    0
+                };
+
+                let ok: BOOL = AppendMenuW(menu, flags, cmd, label_w.as_ptr());
                 if ok == 0 {
                     anyhow::bail!("AppendMenuW(menu item) failed")
                 }
@@ -506,7 +556,11 @@ unsafe fn append_tray_menu_item(
                 }
 
                 let label_w = to_wide_null(label);
-                let ok: BOOL = AppendMenuW(menu, MF_POPUP, submenu as usize, label_w.as_ptr());
+                let mut flags = MF_POPUP;
+                if !*enabled {
+                    flags |= MF_DISABLED;
+                }
+                let ok: BOOL = AppendMenuW(menu, flags, submenu as usize, label_w.as_ptr());
                 if ok == 0 {
                     anyhow::bail!("AppendMenuW(submenu) failed")
                 }
@@ -550,6 +604,7 @@ pub fn set_up_tray(cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem) 
             handler,
             hwnd: ptr::null_mut(),
             menu,
+            click_policy: TrayClickPolicy::default(),
             icon_added: false,
             hicon: ptr::null_mut(),
             hicon_owned: false,

@@ -2,4 +2,7 @@
 mod icon;
 pub mod tray;
 
-pub use tray::{TrayEvent, TrayItem, TrayMenuItem, TrayToggleType};
+pub use tray::{
+    TrayClickAction, TrayClickKind, TrayClickPolicy, TrayEvent, TrayItem, TrayMenuItem,
+    TrayMenuItemRole, TrayToggleType,
+};

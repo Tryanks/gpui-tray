@@ -122,25 +122,37 @@ fn build_tray_item(app_state: &AppState) -> TrayItem {
         .title(app_state.tray_title.to_string())
         .tooltip(app_state.tray_tooltip.to_string())
         .description(String::new())
+        .submenu(TrayMenuItem::info(format!(
+            "Current mode: {}",
+            app_state.view_mode.as_str()
+        )))
+        .submenu(TrayMenuItem::info(format!(
+            "Tray visible: {}",
+            app_state.tray_visible
+        )))
+        .submenu(TrayMenuItem::separator())
         .submenu(TrayMenuItem::radio("List", "List", list_checked))
         .submenu(TrayMenuItem::radio("Grid", "Grid", grid_checked))
         .submenu(TrayMenuItem::separator())
         .submenu(TrayMenuItem::menu("HideWindow", "Hide Window", Vec::new()))
-        .submenu(TrayMenuItem::menu("ShowWindow", "Show Window", Vec::new()))
+        .submenu(TrayMenuItem::menu("ShowWindow", "Show Window", Vec::new()).enabled(!list_checked))
         .submenu(TrayMenuItem::separator())
         .submenu(TrayMenuItem::menu(
             "ToggleVisible",
             "Hide Tray Icon",
             Vec::new(),
         ))
-        .submenu(TrayMenuItem::menu(
-            "Submenu",
-            "Submenu",
-            vec![
-                TrayMenuItem::checkbox("SubToggleCheck", "Toggle Check", false),
-                TrayMenuItem::menu("SubToggleVisible", "Toggle Visible", Vec::new()),
-            ],
-        ))
+        .submenu(
+            TrayMenuItem::menu(
+                "Submenu",
+                "Submenu",
+                vec![
+                    TrayMenuItem::checkbox("SubToggleCheck", "Toggle Check", false),
+                    TrayMenuItem::menu("SubToggleVisible", "Toggle Visible", Vec::new()),
+                ],
+            )
+            .visible(grid_checked),
+        )
         .submenu(TrayMenuItem::separator())
         .submenu(TrayMenuItem::menu("Quit", "Quit", Vec::new()))
 }
@@ -156,43 +168,45 @@ fn main() -> anyhow::Result<()> {
     gpui_platform::application()
         .with_quit_mode(QuitMode::Explicit)
         .run(|cx: &mut App| {
-        cx.set_global(AppState::new());
+            cx.set_global(AppState::new());
 
-        // Ensure macOS shows our app's menu bar when our window is frontmost.
-        cx.set_menus(vec![Menu {
-            name: "tray_demo".into(),
-            items: vec![MenuItem::action("Quit", Quit)],
-        }]);
+            // Ensure macOS shows our app's menu bar when our window is frontmost.
+            cx.set_menus(vec![Menu {
+                name: "tray_demo".into(),
+                items: vec![MenuItem::action("Quit", Quit)],
+            }]);
 
-        cx.activate(true);
-        cx.on_action(quit);
-        cx.on_action(toggle_check);
-        cx.on_action(toggle_visible);
-        cx.on_action(hide_window);
-        cx.on_action(show_window);
+            cx.activate(true);
+            cx.on_action(quit);
+            cx.on_action(toggle_check);
+            cx.on_action(toggle_visible);
+            cx.on_action(hide_window);
+            cx.on_action(show_window);
 
-        cx.on_window_closed(|cx| {
-            if cx.windows().is_empty() {
-                #[cfg(target_os = "macos")]
-                {
-                    if let Err(error) = set_shows_in_dock(false) {
-                        eprintln!("failed to hide Dock icon: {error:#}");
+            cx.on_window_closed(|cx| {
+                if cx.windows().is_empty() {
+                    #[cfg(target_os = "macos")]
+                    {
+                        if let Err(error) = set_shows_in_dock(false) {
+                            eprintln!("failed to hide Dock icon: {error:#}");
+                        }
                     }
                 }
+            })
+            .detach();
+
+            if let Err(error) =
+                cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| Example))
+            {
+                eprintln!("failed to open window: {error:#}");
             }
-        })
-        .detach();
 
-        if let Err(error) = cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| Example)) {
-            eprintln!("failed to open window: {error:#}");
-        }
-
-        let async_app = cx.to_async();
-        let item = build_tray_item(cx.global::<AppState>()).on_event(on_tray_event);
-        if let Err(error) = gpui_tray::tray::set_up_tray(cx, async_app, item) {
-            eprintln!("failed to set up tray: {error:#}");
-        }
-    });
+            let async_app = cx.to_async();
+            let item = build_tray_item(cx.global::<AppState>()).on_event(on_tray_event);
+            if let Err(error) = gpui_tray::tray::set_up_tray(cx, async_app, item) {
+                eprintln!("failed to set up tray: {error:#}");
+            }
+        });
 
     Ok(())
 }

@@ -1,14 +1,18 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::tray::{TrayEvent, TrayEventCallbackSlot, TrayItem, TrayMenuItem, TrayToggleType};
+use crate::tray::{
+    TrayClickAction, TrayClickKind, TrayClickPolicy, TrayEvent, TrayEventCallbackSlot, TrayItem,
+    TrayMenuItem, TrayToggleType,
+};
 use anyhow::{Context as _, Result};
-use gpui::AsyncApp;
+use gpui::{AsyncApp, MouseButton, Point};
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, NSObject, Sel};
 use objc2::{AnyThread, ClassType, MainThreadMarker, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
-    NSCellImagePosition, NSControlStateValueOff, NSControlStateValueOn, NSImage, NSMenu,
-    NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSApplication, NSCellImagePosition, NSControlStateValueOff, NSControlStateValueOn, NSEvent,
+    NSEventMask, NSEventType, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
+    NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSData, NSSize, NSString};
 use std::{
@@ -103,6 +107,26 @@ fn target_class() -> Result<&'static AnyClass> {
             }
         }
 
+        extern "C" fn on_status_item_click(
+            _this: *mut NSObject,
+            _cmd: Sel,
+            sender: *mut AnyObject,
+        ) {
+            if sender.is_null() {
+                return;
+            }
+
+            TRAY.with(|tray_cell| {
+                let Ok(mut tray_slot) = tray_cell.try_borrow_mut() else {
+                    return;
+                };
+                let Some(tray) = tray_slot.as_mut() else {
+                    return;
+                };
+                let _ = tray.handle_status_item_click();
+            });
+        }
+
         extern "C" fn dealloc(this: *mut NSObject, _cmd: Sel) {
             unsafe {
                 let Some(this_ref) = this.as_ref() else {
@@ -123,8 +147,11 @@ fn target_class() -> Result<&'static AnyClass> {
 
         unsafe {
             let on_menu_item_fn: extern "C" fn(*mut NSObject, Sel, *mut AnyObject) = on_menu_item;
+            let on_status_item_click_fn: extern "C" fn(*mut NSObject, Sel, *mut AnyObject) =
+                on_status_item_click;
             let dealloc_fn: extern "C" fn(*mut NSObject, Sel) = dealloc;
             builder.add_method::<NSObject, _>(sel!(onMenuItem:), on_menu_item_fn);
+            builder.add_method::<NSObject, _>(sel!(onStatusItemClick:), on_status_item_click_fn);
             builder.add_method::<NSObject, _>(sel!(dealloc), dealloc_fn);
         }
 
@@ -141,6 +168,7 @@ struct Tray {
     menu: Retained<NSMenu>,
     target: Retained<AnyObject>,
     handler: Handler,
+    click_policy: TrayClickPolicy,
 }
 
 thread_local! {
@@ -191,6 +219,7 @@ pub fn set_up_tray(cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem) 
                 menu,
                 target,
                 handler,
+                click_policy: TrayClickPolicy::default(),
             });
             Ok(())
         })?;
@@ -230,11 +259,15 @@ impl Tray {
         self.rebuild_menu(&item.submenus)?;
 
         let status_item = self.status_item.as_ref().context("status item is nil")?;
-        status_item.setMenu(Some(&self.menu));
 
         let button = status_item
             .button(self.mtm)
             .context("status item button is nil")?;
+        unsafe { button.setTarget(Some(&self.target)) };
+        unsafe { button.setAction(Some(sel!(onStatusItemClick:))) };
+        button.sendActionOn(
+            NSEventMask::LeftMouseUp | NSEventMask::RightMouseUp | NSEventMask::OtherMouseUp,
+        );
 
         let tooltip = NSString::from_str(item.tooltip.as_str());
         button.setToolTip(Some(&tooltip));
@@ -252,6 +285,58 @@ impl Tray {
             nsimage.setTemplate(true);
         } else {
             button.setImage(None);
+        }
+
+        self.click_policy = item.click_policy;
+
+        Ok(())
+    }
+
+    fn handle_status_item_click(&mut self) -> Result<()> {
+        let app = NSApplication::sharedApplication(self.mtm);
+        let event = app
+            .currentEvent()
+            .context("status item click missing event")?;
+        let mouse_location = NSEvent::mouseLocation();
+        let position = Point {
+            x: mouse_location.x as i32,
+            y: mouse_location.y as i32,
+        };
+
+        let (action, button, kind) = match event.r#type() {
+            NSEventType::RightMouseUp => (
+                self.click_policy.right,
+                MouseButton::Right,
+                TrayClickKind::Single,
+            ),
+            NSEventType::LeftMouseUp if event.clickCount() >= 2 => (
+                self.click_policy.double_click,
+                MouseButton::Left,
+                TrayClickKind::Double,
+            ),
+            NSEventType::LeftMouseUp => (
+                self.click_policy.left,
+                MouseButton::Left,
+                TrayClickKind::Single,
+            ),
+            _ => return Ok(()),
+        };
+
+        match action {
+            TrayClickAction::EmitEvent => {
+                self.handler.dispatch(TrayEvent::TrayClick {
+                    button,
+                    kind,
+                    position,
+                });
+            }
+            TrayClickAction::OpenMenu => {
+                if let Some(status_item) = self.status_item.as_ref() {
+                    #[allow(deprecated)]
+                    status_item.popUpStatusItemMenu(&self.menu);
+                }
+            }
+            TrayClickAction::Ignore => {}
         }
 
         Ok(())
@@ -320,24 +405,27 @@ unsafe fn add_tray_menu_item(
     next_tag: &mut i64,
 ) -> Result<()> {
     match item {
-        TrayMenuItem::Separator { .. } => {
+        TrayMenuItem::Separator { visible, .. } => {
+            if !*visible {
+                return Ok(());
+            }
             let separator = NSMenuItem::separatorItem(mtm);
             menu.addItem(&separator);
         }
         TrayMenuItem::Submenu {
-            id: user_id,
+            id: _,
             label,
+            enabled,
+            visible,
+            role: _,
             toggle_type,
             children,
         } => {
+            if !*visible {
+                return Ok(());
+            }
+
             if children.is_empty() {
-                let tag = *next_tag;
-                *next_tag += 1;
-
-                if let Ok(mut map) = handler.tag_to_id.lock() {
-                    map.insert(tag, user_id.clone());
-                }
-
                 let title = NSString::from_str(label.as_str());
                 let key_equiv = NSString::from_str("");
                 let menu_item = unsafe {
@@ -348,9 +436,17 @@ unsafe fn add_tray_menu_item(
                         &key_equiv,
                     )
                 };
+                if let Some(user_id) = item.menu_event_id() {
+                    let tag = *next_tag;
+                    *next_tag += 1;
 
-                unsafe { menu_item.setTarget(Some(target)) };
-                menu_item.setTag(tag as _);
+                    if let Ok(mut map) = handler.tag_to_id.lock() {
+                        map.insert(tag, user_id.to_string());
+                    }
+
+                    unsafe { menu_item.setTarget(Some(target)) };
+                    menu_item.setTag(tag as _);
+                }
 
                 let checked = match toggle_type {
                     Some(TrayToggleType::Checkbox(checked)) => *checked,
@@ -363,6 +459,7 @@ unsafe fn add_tray_menu_item(
                     NSControlStateValueOff
                 };
                 menu_item.setState(state_value);
+                menu_item.setEnabled(*enabled);
 
                 menu.addItem(&menu_item);
             } else {
@@ -383,6 +480,7 @@ unsafe fn add_tray_menu_item(
                     add_tray_menu_item(&submenu, child, handler, target, mtm, next_tag)?;
                 }
 
+                submenu_item.setEnabled(*enabled);
                 submenu_item.setSubmenu(Some(&submenu));
                 menu.addItem(&submenu_item);
             }

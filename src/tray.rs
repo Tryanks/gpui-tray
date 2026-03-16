@@ -11,15 +11,25 @@ pub enum TrayToggleType {
     Radio(bool),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrayMenuItemRole {
+    Standard,
+    Info,
+}
+
 /// Item used to describe a tray context menu.
 #[derive(Clone, Debug)]
 pub enum TrayMenuItem {
     Separator {
         label: Option<String>,
+        visible: bool,
     },
     Submenu {
-        id: String,
+        id: Option<String>,
         label: String,
+        enabled: bool,
+        visible: bool,
+        role: TrayMenuItemRole,
         toggle_type: Option<TrayToggleType>,
         children: Vec<TrayMenuItem>,
     },
@@ -27,12 +37,16 @@ pub enum TrayMenuItem {
 
 impl TrayMenuItem {
     pub fn separator() -> Self {
-        Self::Separator { label: None }
+        Self::Separator {
+            label: None,
+            visible: true,
+        }
     }
 
     pub fn labeled_separator(label: impl Into<String>) -> Self {
         Self::Separator {
             label: Some(label.into()),
+            visible: true,
         }
     }
 
@@ -42,8 +56,11 @@ impl TrayMenuItem {
         children: Vec<TrayMenuItem>,
     ) -> Self {
         Self::Submenu {
-            id: id.into(),
+            id: Some(id.into()),
             label: label.into(),
+            enabled: true,
+            visible: true,
+            role: TrayMenuItemRole::Standard,
             toggle_type: None,
             children,
         }
@@ -51,8 +68,11 @@ impl TrayMenuItem {
 
     pub fn checkbox(id: impl Into<String>, label: impl Into<String>, checked: bool) -> Self {
         Self::Submenu {
-            id: id.into(),
+            id: Some(id.into()),
             label: label.into(),
+            enabled: true,
+            visible: true,
+            role: TrayMenuItemRole::Standard,
             toggle_type: Some(TrayToggleType::Checkbox(checked)),
             children: Vec::new(),
         }
@@ -60,10 +80,133 @@ impl TrayMenuItem {
 
     pub fn radio(id: impl Into<String>, label: impl Into<String>, checked: bool) -> Self {
         Self::Submenu {
-            id: id.into(),
+            id: Some(id.into()),
             label: label.into(),
+            enabled: true,
+            visible: true,
+            role: TrayMenuItemRole::Standard,
             toggle_type: Some(TrayToggleType::Radio(checked)),
             children: Vec::new(),
+        }
+    }
+
+    pub fn label(label: impl Into<String>) -> Self {
+        Self::info(label)
+    }
+
+    pub fn info(label: impl Into<String>) -> Self {
+        Self::Submenu {
+            id: None,
+            label: label.into(),
+            enabled: false,
+            visible: true,
+            role: TrayMenuItemRole::Info,
+            toggle_type: None,
+            children: Vec::new(),
+        }
+    }
+
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        if let Self::Submenu {
+            enabled: item_enabled,
+            ..
+        } = &mut self
+        {
+            *item_enabled = enabled;
+        }
+        self
+    }
+
+    pub fn visible(mut self, visible: bool) -> Self {
+        match &mut self {
+            Self::Separator {
+                visible: item_visible,
+                ..
+            } => *item_visible = visible,
+            Self::Submenu {
+                visible: item_visible,
+                ..
+            } => *item_visible = visible,
+        }
+        self
+    }
+
+    pub(crate) fn menu_event_id(&self) -> Option<&str> {
+        match self {
+            Self::Separator { .. } => None,
+            Self::Submenu {
+                id,
+                enabled,
+                role,
+                children,
+                ..
+            } if *enabled && *role == TrayMenuItemRole::Standard && children.is_empty() => {
+                id.as_deref()
+            }
+            Self::Submenu { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrayClickAction {
+    EmitEvent,
+    OpenMenu,
+    Ignore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrayClickKind {
+    Single,
+    Double,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrayClickPolicy {
+    pub left: TrayClickAction,
+    pub right: TrayClickAction,
+    pub double_click: TrayClickAction,
+}
+
+impl TrayClickPolicy {
+    pub fn platform_default() -> Self {
+        Self::default()
+    }
+
+    pub fn left(mut self, action: TrayClickAction) -> Self {
+        self.left = action;
+        self
+    }
+
+    pub fn right(mut self, action: TrayClickAction) -> Self {
+        self.right = action;
+        self
+    }
+
+    pub fn double_click(mut self, action: TrayClickAction) -> Self {
+        self.double_click = action;
+        self
+    }
+}
+
+impl Default for TrayClickPolicy {
+    fn default() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self {
+                left: TrayClickAction::OpenMenu,
+                right: TrayClickAction::OpenMenu,
+                double_click: TrayClickAction::OpenMenu,
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self {
+                left: TrayClickAction::EmitEvent,
+                right: TrayClickAction::OpenMenu,
+                double_click: TrayClickAction::EmitEvent,
+            }
         }
     }
 }
@@ -72,6 +215,7 @@ impl TrayMenuItem {
 pub enum TrayEvent {
     TrayClick {
         button: MouseButton,
+        kind: TrayClickKind,
         position: Point<i32>,
     },
     Scroll {
@@ -89,6 +233,7 @@ pub struct TrayItem {
     pub(crate) tooltip: String,
     pub(crate) description: String,
     pub(crate) submenus: Vec<TrayMenuItem>,
+    pub(crate) click_policy: TrayClickPolicy,
     pub(crate) event: Option<TrayEventCallback>,
 }
 
@@ -101,6 +246,7 @@ impl TrayItem {
             tooltip: String::new(),
             description: String::new(),
             submenus: Vec::new(),
+            click_policy: TrayClickPolicy::default(),
             event: None,
         }
     }
@@ -132,6 +278,11 @@ impl TrayItem {
 
     pub fn submenu(mut self, submenu: TrayMenuItem) -> Self {
         self.submenus.push(submenu);
+        self
+    }
+
+    pub fn click_policy(mut self, click_policy: TrayClickPolicy) -> Self {
+        self.click_policy = click_policy;
         self
     }
 
