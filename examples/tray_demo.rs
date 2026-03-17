@@ -1,5 +1,5 @@
 use gpui::{
-    App, Context, Div, Global, Menu, MenuItem, QuitMode, SharedString, Stateful, Window,
+    App, Context, Div, Font, Global, Menu, MenuItem, QuitMode, SharedString, Stateful, Window,
     WindowOptions, actions, div, prelude::*,
 };
 use gpui_tray::{TrayEvent, TrayHandle, TrayMenuItem, TrayState};
@@ -80,6 +80,7 @@ impl Render for Example {
         let app_state = cx.global::<AppState>();
 
         div()
+            .font(ui_font())
             .bg(gpui::white())
             .flex()
             .flex_col()
@@ -108,6 +109,18 @@ impl Render for Example {
                             }),
                     ),
             )
+    }
+}
+
+fn ui_font() -> Font {
+    #[cfg(windows)]
+    {
+        gpui::font("Segoe UI")
+    }
+
+    #[cfg(not(windows))]
+    {
+        Font::default()
     }
 }
 

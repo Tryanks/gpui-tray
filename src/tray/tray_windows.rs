@@ -1,3 +1,5 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use crate::tray::{
     TrayClickAction, TrayClickKind, TrayClickPolicy, TrayEvent, TrayEventCallback,
     TrayEventCallbackSlot, TrayMenuItem, TrayRuntimeState, TrayState, TrayToggleType,
@@ -85,9 +87,9 @@ struct Handler {
 impl Handler {
     fn dispatch(&self, event: TrayEvent) {
         let async_app = self.async_app.clone();
+        let executor = async_app.foreground_executor().clone();
         let callback = self.callback.clone();
-        async_app
-            .foreground_executor()
+        executor
             .spawn(async move {
                 async_app.update(|cx| {
                     if let Ok(mut slot) = callback.lock()
@@ -336,7 +338,7 @@ fn schedule_flush(async_app: AsyncApp) {
 }
 
 fn handle_tray_click(click_code: usize) -> Result<()> {
-    let mut platform = TRAY_RUNTIME.with(|runtime_cell| {
+    let platform = TRAY_RUNTIME.with(|runtime_cell| {
         let mut runtime_slot = runtime_cell
             .try_borrow_mut()
             .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
