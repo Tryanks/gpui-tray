@@ -1,6 +1,7 @@
 use crate::tray::{
-    TrayClickAction, TrayClickKind, TrayClickPolicy, TrayEvent, TrayEventCallbackSlot, TrayItem,
-    TrayMenuItem, TrayToggleType,
+    TrayClickAction, TrayClickKind, TrayClickPolicy, TrayEvent, TrayEventCallback,
+    TrayEventCallbackSlot, TrayMenuItem, TrayRuntimeState, TrayState, TrayToggleType,
+    VersionedTrayState,
 };
 use anyhow::{Context as _, Result};
 use gpui::{AsyncApp, MouseButton, Point};
@@ -95,7 +96,7 @@ struct LinuxTrayItem {
     click_policy: TrayClickPolicy,
 }
 
-fn linux_item_from_tray_item(item: TrayItem) -> Result<LinuxTrayItem> {
+fn linux_item_from_tray_state(item: TrayState) -> Result<LinuxTrayItem> {
     let icon_pixmaps = icon_pixmaps_from_item(&item)?.unwrap_or_default();
     let menu = DBusMenu::from_tray_menu_items(&item.submenus);
     Ok(LinuxTrayItem {
@@ -109,7 +110,7 @@ fn linux_item_from_tray_item(item: TrayItem) -> Result<LinuxTrayItem> {
     })
 }
 
-fn icon_pixmaps_from_item(item: &TrayItem) -> Result<Option<Vec<Pixmap>>> {
+fn icon_pixmaps_from_item(item: &TrayState) -> Result<Option<Vec<Pixmap>>> {
     let Some(icon) = item.icon.as_ref() else {
         return Ok(None);
     };
@@ -641,15 +642,53 @@ impl StatusNotifierItemInterface {
 }
 
 enum Command {
-    Update(LinuxTrayItem),
+    Flush,
 }
 
-struct LinuxTrayHandle {
+struct LinuxTrayInner {
+    runtime: Mutex<TrayRuntimeState>,
     callback: TrayEventCallbackSlot,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<Command>,
 }
 
-static LINUX_TRAY: OnceLock<LinuxTrayHandle> = OnceLock::new();
+#[derive(Clone)]
+pub struct TrayHandle {
+    inner: Arc<LinuxTrayInner>,
+}
+
+impl TrayHandle {
+    pub fn set_state(&self, state: TrayState) -> Result<()> {
+        let should_flush = self
+            .inner
+            .runtime
+            .lock()
+            .map(|mut runtime| runtime.set_desired_state(state))
+            .unwrap_or(false);
+
+        if should_flush {
+            let _ = self.inner.cmd_tx.send(Command::Flush);
+        }
+
+        Ok(())
+    }
+
+    pub fn flush_now(&self, _cx: &mut gpui::App) -> Result<()> {
+        let should_flush = self
+            .inner
+            .runtime
+            .lock()
+            .map(|mut runtime| runtime.request_flush())
+            .unwrap_or(false);
+
+        if should_flush {
+            let _ = self.inner.cmd_tx.send(Command::Flush);
+        }
+
+        Ok(())
+    }
+}
+
+static LINUX_TRAY: OnceLock<TrayHandle> = OnceLock::new();
 
 fn make_bus_name() -> String {
     // Format inspired by common implementations; must be a unique well-formed bus name.
@@ -680,203 +719,155 @@ async fn register_with_watcher(connection: &zbus::Connection, service: &str) -> 
     Ok(())
 }
 
-pub fn set_up_tray(_cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem) -> Result<()> {
+pub fn set_up_tray(
+    cx: &mut gpui::App,
+    async_app: AsyncApp,
+    initial: TrayState,
+    on_event: TrayEventCallback,
+) -> Result<TrayHandle> {
     if LINUX_TRAY.get().is_some() {
         anyhow::bail!("tray already initialized");
     }
 
-    let callback = Arc::new(Mutex::new(item.event.take()));
-
-    let linux_item = linux_item_from_tray_item(item)?;
+    let callback = Arc::new(Mutex::new(Some(on_event)));
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
 
     // Event fan-in for Activate/Scroll/Menu clicks from DBus interfaces.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<LinuxEvent>();
 
-    let state = Arc::new(Mutex::new(StatusNotifierItemState {
-        visible: linux_item.visible,
-        title: linux_item.title.clone(),
-        icon_pixmaps: linux_item.icon_pixmaps.clone(),
-        tooltip: linux_item.tooltip.clone(),
-        description: linux_item.description.clone(),
-    }));
-    let click_policy = Arc::new(Mutex::new(linux_item.click_policy));
-
-    let menu = Arc::new(Mutex::new(linux_item.menu.clone()));
+    let state = Arc::new(Mutex::new(StatusNotifierItemState::default()));
+    let click_policy = Arc::new(Mutex::new(TrayClickPolicy::default()));
+    let menu = Arc::new(Mutex::new(DBusMenu::new()));
     let revision = Arc::new(AtomicU32::new(1));
 
-    // Store handle before spawning so sync_tray can send updates immediately after setup.
-    LINUX_TRAY
-        .set(LinuxTrayHandle {
+    let handle = TrayHandle {
+        inner: Arc::new(LinuxTrayInner {
+            runtime: Mutex::new(TrayRuntimeState::new(initial)),
             callback: callback.clone(),
             cmd_tx: cmd_tx.clone(),
-        })
+        }),
+    };
+
+    LINUX_TRAY
+        .set(handle.clone())
         .map_err(|_| anyhow::anyhow!("tray storage already initialized"))?;
 
     async_app
         .spawn(move |cx: &mut AsyncApp| {
             let async_app = cx.clone();
             let callback = callback.clone();
+            let handle = handle.clone();
             let click_policy = click_policy.clone();
             async move {
-            let service = make_bus_name();
+                let service = make_bus_name();
 
-            let status_iface = StatusNotifierItemInterface {
-                state: state.clone(),
-                events: event_tx.clone(),
-            };
+                let status_iface = StatusNotifierItemInterface {
+                    state: state.clone(),
+                    events: event_tx.clone(),
+                };
 
-            let menu_iface = DBusMenuInterface {
-                menu: menu.clone(),
-                revision: revision.clone(),
-                events: event_tx.clone(),
-            };
+                let menu_iface = DBusMenuInterface {
+                    menu: menu.clone(),
+                    revision: revision.clone(),
+                    events: event_tx.clone(),
+                };
 
-            let builder = zbus::connection::Builder::session();
-            let Ok(builder) = builder else {
-                return;
-            };
+                let builder = zbus::connection::Builder::session();
+                let Ok(builder) = builder else {
+                    return;
+                };
 
-            let builder = builder.name(service.clone());
-            let Ok(builder) = builder else {
-                return;
-            };
+                let builder = builder.name(service.clone());
+                let Ok(builder) = builder else {
+                    return;
+                };
 
-            let builder = builder.serve_at(STATUS_NOTIFIER_ITEM_PATH, status_iface);
-            let Ok(builder) = builder else {
-                return;
-            };
+                let builder = builder.serve_at(STATUS_NOTIFIER_ITEM_PATH, status_iface);
+                let Ok(builder) = builder else {
+                    return;
+                };
 
-            let builder = builder.serve_at(DBUS_MENU_PATH, menu_iface);
-            let Ok(builder) = builder else {
-                return;
-            };
+                let builder = builder.serve_at(DBUS_MENU_PATH, menu_iface);
+                let Ok(builder) = builder else {
+                    return;
+                };
 
-            let connection = builder.build().await;
-            let Ok(connection) = connection else {
-                return;
-            };
+                let connection = builder.build().await;
+                let Ok(connection) = connection else {
+                    return;
+                };
 
-            // Best-effort watcher registration; some environments may not have a watcher.
-            let _ = register_with_watcher(&connection, &service).await;
+                let _ = register_with_watcher(&connection, &service).await;
 
-            let status_ref = connection
-                .object_server()
-                .interface::<_, StatusNotifierItemInterface>(STATUS_NOTIFIER_ITEM_PATH)
-                .await
-                .ok();
-            let menu_ref = connection
-                .object_server()
-                .interface::<_, DBusMenuInterface>(DBUS_MENU_PATH)
-                .await
-                .ok();
+                let status_ref = connection
+                    .object_server()
+                    .interface::<_, StatusNotifierItemInterface>(STATUS_NOTIFIER_ITEM_PATH)
+                    .await
+                    .ok();
+                let menu_ref = connection
+                    .object_server()
+                    .interface::<_, DBusMenuInterface>(DBUS_MENU_PATH)
+                    .await
+                    .ok();
 
-            loop {
-                tokio::select! {
-                    Some(cmd) = cmd_rx.recv() => {
-                        match cmd {
-                            Command::Update(update) => {
-                                if let Ok(mut s) = state.lock() {
-                                    s.visible = update.visible;
-                                    s.title = update.title;
-                                    s.icon_pixmaps = update.icon_pixmaps;
-                                    s.tooltip = update.tooltip;
-                                    s.description = update.description;
-                                }
-                                if let Ok(mut policy) = click_policy.lock() {
-                                    *policy = update.click_policy;
-                                }
-                                if let Ok(mut m) = menu.lock() {
-                                    *m = update.menu;
-                                }
-                                let rev = revision.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-
-                                if let Some(status_ref) = status_ref.as_ref() {
-                                    let emitter = status_ref.signal_emitter();
-                                    let _ = StatusNotifierItemInterface::new_title(emitter).await;
-                                    let _ = StatusNotifierItemInterface::new_icon(emitter).await;
-                                    let _ = StatusNotifierItemInterface::new_tooltip(emitter).await;
-                                    let _ = StatusNotifierItemInterface::new_status(
-                                        emitter,
-                                        {
-                                            let visible =
-                                                state.lock().ok().map(|s| s.visible).unwrap_or(true);
-                                            if visible {
-                                                "Active".to_string()
-                                            } else {
-                                                "Passive".to_string()
-                                            }
-                                        },
+                loop {
+                    tokio::select! {
+                        Some(cmd) = cmd_rx.recv() => {
+                            match cmd {
+                                Command::Flush => {
+                                    let _ = flush_linux_runtime(
+                                        &handle,
+                                        &state,
+                                        &click_policy,
+                                        &menu,
+                                        &revision,
+                                        status_ref.as_ref(),
+                                        menu_ref.as_ref(),
                                     )
                                     .await;
-                                    let _ = StatusNotifierItemInterface::new_menu(emitter).await;
-                                }
-
-                                if let Some(menu_ref) = menu_ref.as_ref() {
-                                    let emitter = menu_ref.signal_emitter();
-                                    let _ = DBusMenuInterface::layout_updated(emitter, rev, 0).await;
                                 }
                             }
                         }
-                    }
-                    Some(ev) = event_rx.recv() => {
-                        let policy = click_policy.lock().ok().map(|policy| *policy).unwrap_or_default();
-                        let event = match ev {
-                            LinuxEvent::Activate(x,y) => map_click_event(
-                                policy.left,
-                                MouseButton::Left,
-                                TrayClickKind::Single,
-                                Point { x, y },
-                            ),
-                            LinuxEvent::SecondaryActivate(x,y) => map_click_event(
-                                policy.right,
-                                MouseButton::Right,
-                                TrayClickKind::Single,
-                                Point { x, y },
-                            ),
-                            LinuxEvent::Scroll(delta, orientation) => {
-                                let o = orientation.to_ascii_lowercase();
-                                let scroll_detal = if o.contains("horizontal") {
-                                    Point { x: delta, y: 0 }
-                                } else {
-                                    Point { x: 0, y: delta }
-                                };
-                                Some(TrayEvent::Scroll { scroll_detal })
+                        Some(ev) = event_rx.recv() => {
+                            let policy = click_policy.lock().ok().map(|policy| *policy).unwrap_or_default();
+                            let event = match ev {
+                                LinuxEvent::Activate(x,y) => map_click_event(
+                                    policy.left,
+                                    MouseButton::Left,
+                                    TrayClickKind::Single,
+                                    Point { x, y },
+                                ),
+                                LinuxEvent::SecondaryActivate(x,y) => map_click_event(
+                                    policy.right,
+                                    MouseButton::Right,
+                                    TrayClickKind::Single,
+                                    Point { x, y },
+                                ),
+                                LinuxEvent::Scroll(delta, orientation) => {
+                                    let o = orientation.to_ascii_lowercase();
+                                    let scroll_detal = if o.contains("horizontal") {
+                                        Point { x: delta, y: 0 }
+                                    } else {
+                                        Point { x: 0, y: delta }
+                                    };
+                                    Some(TrayEvent::Scroll { scroll_detal })
+                                }
+                                LinuxEvent::MenuClick(id) => Some(TrayEvent::MenuClick { id }),
+                            };
+                            if let Some(event) = event {
+                                dispatch_event(&async_app, &callback, event);
                             }
-                            LinuxEvent::MenuClick(id) => Some(TrayEvent::MenuClick { id }),
-                        };
-                        if let Some(event) = event {
-                            dispatch_event(&async_app, &callback, event);
                         }
+                        else => break,
                     }
-                    else => break,
                 }
             }
-        }
-    })
-    .detach();
+        })
+        .detach();
 
-    // Push initial state through the same codepath (signals/layout update).
-    let _ = cmd_tx.send(Command::Update(linux_item));
-    Ok(())
-}
-
-pub fn sync_tray(_cx: &mut gpui::App, mut item: TrayItem) -> Result<()> {
-    let Some(handle) = LINUX_TRAY.get() else {
-        return Ok(());
-    };
-
-    // Replace callback if provided.
-    if let Some(cb) = item.event.take()
-        && let Ok(mut slot) = handle.callback.lock()
-    {
-        *slot = Some(cb);
-    }
-
-    let linux_item =
-        linux_item_from_tray_item(item).context("failed to build linux tray payload")?;
-    let _ = handle.cmd_tx.send(Command::Update(linux_item));
-    Ok(())
+    let _ = handle.inner.cmd_tx.send(Command::Flush);
+    let _ = cx;
+    Ok(handle)
 }
 
 fn map_click_event(
@@ -893,4 +884,110 @@ fn map_click_event(
         }),
         TrayClickAction::OpenMenu | TrayClickAction::Ignore => None,
     }
+}
+
+async fn flush_linux_runtime(
+    handle: &TrayHandle,
+    state: &Arc<Mutex<StatusNotifierItemState>>,
+    click_policy: &Arc<Mutex<TrayClickPolicy>>,
+    menu: &Arc<Mutex<DBusMenu>>,
+    revision: &Arc<AtomicU32>,
+    status_ref: Option<&zbus::object_server::InterfaceRef<StatusNotifierItemInterface>>,
+    menu_ref: Option<&zbus::object_server::InterfaceRef<DBusMenuInterface>>,
+) -> Result<()> {
+    loop {
+        let versioned_state = handle
+            .inner
+            .runtime
+            .lock()
+            .ok()
+            .and_then(|mut runtime| runtime.try_begin_flush());
+
+        let Some(versioned_state) = versioned_state else {
+            return Ok(());
+        };
+
+        let apply_result = apply_linux_state(
+            &versioned_state,
+            state,
+            click_policy,
+            menu,
+            revision,
+            status_ref,
+            menu_ref,
+        )
+        .await;
+
+        let should_continue = handle
+            .inner
+            .runtime
+            .lock()
+            .map(|mut runtime| {
+                if apply_result.is_ok() {
+                    runtime.finish_flush(versioned_state)
+                } else {
+                    runtime.abort_flush();
+                    false
+                }
+            })
+            .unwrap_or(false);
+
+        apply_result?;
+
+        if !should_continue {
+            return Ok(());
+        }
+    }
+}
+
+async fn apply_linux_state(
+    versioned_state: &VersionedTrayState,
+    state: &Arc<Mutex<StatusNotifierItemState>>,
+    click_policy: &Arc<Mutex<TrayClickPolicy>>,
+    menu: &Arc<Mutex<DBusMenu>>,
+    revision: &Arc<AtomicU32>,
+    status_ref: Option<&zbus::object_server::InterfaceRef<StatusNotifierItemInterface>>,
+    menu_ref: Option<&zbus::object_server::InterfaceRef<DBusMenuInterface>>,
+) -> Result<()> {
+    let update = linux_item_from_tray_state(versioned_state.state.clone())
+        .context("failed to build linux tray payload")?;
+
+    if let Ok(mut s) = state.lock() {
+        s.visible = update.visible;
+        s.title = update.title;
+        s.icon_pixmaps = update.icon_pixmaps;
+        s.tooltip = update.tooltip;
+        s.description = update.description;
+    }
+    if let Ok(mut policy) = click_policy.lock() {
+        *policy = update.click_policy;
+    }
+    if let Ok(mut m) = menu.lock() {
+        *m = update.menu;
+    }
+    let rev = revision.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+
+    if let Some(status_ref) = status_ref {
+        let emitter = status_ref.signal_emitter();
+        let _ = StatusNotifierItemInterface::new_title(emitter).await;
+        let _ = StatusNotifierItemInterface::new_icon(emitter).await;
+        let _ = StatusNotifierItemInterface::new_tooltip(emitter).await;
+        let _ = StatusNotifierItemInterface::new_status(emitter, {
+            let visible = state.lock().ok().map(|s| s.visible).unwrap_or(true);
+            if visible {
+                "Active".to_string()
+            } else {
+                "Passive".to_string()
+            }
+        })
+        .await;
+        let _ = StatusNotifierItemInterface::new_menu(emitter).await;
+    }
+
+    if let Some(menu_ref) = menu_ref {
+        let emitter = menu_ref.signal_emitter();
+        let _ = DBusMenuInterface::layout_updated(emitter, rev, 0).await;
+    }
+
+    Ok(())
 }

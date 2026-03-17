@@ -1,8 +1,9 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::tray::{
-    TrayClickAction, TrayClickKind, TrayClickPolicy, TrayEvent, TrayEventCallbackSlot, TrayItem,
-    TrayMenuItem, TrayToggleType,
+    TrayClickAction, TrayClickKind, TrayClickPolicy, TrayEvent, TrayEventCallback,
+    TrayEventCallbackSlot, TrayMenuItem, TrayRuntimeState, TrayState, TrayToggleType,
+    VersionedTrayState,
 };
 use anyhow::{Context as _, Result};
 use gpui::{AsyncApp, MouseButton, Point};
@@ -22,6 +23,34 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
+#[derive(Clone, Default)]
+pub struct TrayHandle;
+
+impl TrayHandle {
+    pub fn set_state(&self, state: TrayState) -> Result<()> {
+        let async_app = TRAY_RUNTIME.with(|runtime_cell| -> Result<Option<AsyncApp>> {
+            let mut runtime_slot = runtime_cell
+                .try_borrow_mut()
+                .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
+            let runtime = runtime_slot
+                .as_mut()
+                .context("tray has not been initialized")?;
+            let should_schedule = runtime.state.set_desired_state(state);
+            Ok(should_schedule.then(|| runtime.async_app.clone()))
+        })?;
+
+        if let Some(async_app) = async_app {
+            schedule_flush(async_app);
+        }
+
+        Ok(())
+    }
+
+    pub fn flush_now(&self, _cx: &mut gpui::App) -> Result<()> {
+        flush_runtime()
+    }
+}
+
 fn with_pool<T>(f: impl FnOnce() -> T) -> T {
     autoreleasepool(|_| f())
 }
@@ -40,16 +69,19 @@ struct Handler {
 impl Handler {
     fn dispatch(&self, event: TrayEvent) {
         let async_app = self.async_app.clone();
+        let executor = async_app.foreground_executor().clone();
         let callback = self.callback.clone();
-        async_app.update(|cx| {
-            cx.defer(move |cx| {
-                if let Ok(mut slot) = callback.lock()
-                    && let Some(cb) = slot.as_mut()
-                {
-                    cb(event, cx);
-                }
-            });
-        });
+        executor
+            .spawn(async move {
+                async_app.update(|cx| {
+                    if let Ok(mut slot) = callback.lock()
+                        && let Some(cb) = slot.as_mut()
+                    {
+                        cb(event, cx);
+                    }
+                });
+            })
+            .detach();
     }
 
     fn dispatch_tag(&self, tag: i64) {
@@ -57,7 +89,7 @@ impl Handler {
             .tag_to_id
             .lock()
             .ok()
-            .and_then(|m| m.get(&tag).cloned());
+            .and_then(|map| map.get(&tag).cloned());
         if let Some(id) = id {
             self.dispatch(TrayEvent::MenuClick { id });
         }
@@ -66,6 +98,41 @@ impl Handler {
 
 struct TargetState {
     handler: Handler,
+}
+
+struct StatusItemClickContext {
+    handler: Handler,
+    click_policy: TrayClickPolicy,
+    status_item: Option<Retained<NSStatusItem>>,
+    menu: Retained<NSMenu>,
+}
+
+struct TrayPlatform {
+    mtm: MainThreadMarker,
+    status_item: Option<Retained<NSStatusItem>>,
+    menu: Retained<NSMenu>,
+    target: Retained<AnyObject>,
+    handler: Handler,
+    click_policy: TrayClickPolicy,
+}
+
+struct TrayRuntime {
+    async_app: AsyncApp,
+    state: TrayRuntimeState,
+    platform: Option<Box<TrayPlatform>>,
+    interaction_active: bool,
+}
+
+thread_local! {
+    static TRAY_RUNTIME: RefCell<Option<TrayRuntime>> = const { RefCell::new(None) };
+}
+
+impl Drop for TrayPlatform {
+    fn drop(&mut self) {
+        if let Some(item) = self.status_item.take() {
+            NSStatusBar::systemStatusBar().removeStatusItem(&item);
+        }
+    }
 }
 
 fn target_class() -> Result<&'static AnyClass> {
@@ -116,15 +183,7 @@ fn target_class() -> Result<&'static AnyClass> {
                 return;
             }
 
-            TRAY.with(|tray_cell| {
-                let Ok(mut tray_slot) = tray_cell.try_borrow_mut() else {
-                    return;
-                };
-                let Some(tray) = tray_slot.as_mut() else {
-                    return;
-                };
-                let _ = tray.handle_status_item_click();
-            });
+            let _ = handle_status_item_click();
         }
 
         extern "C" fn dealloc(this: *mut NSObject, _cmd: Sel) {
@@ -139,7 +198,6 @@ fn target_class() -> Result<&'static AnyClass> {
                     drop(Box::from_raw(state_ptr as *mut TargetState));
                     *ivar.load_ptr::<*mut c_void>(this_ref) = std::ptr::null_mut::<c_void>();
                 }
-                // Super calls require a mutable message receiver.
                 let this_any: &mut AnyObject = &mut *this.cast::<AnyObject>();
                 let _: () = msg_send![super(this_any, NSObject::class()), dealloc];
             }
@@ -162,36 +220,20 @@ fn target_class() -> Result<&'static AnyClass> {
     Ok(class)
 }
 
-struct Tray {
-    mtm: MainThreadMarker,
-    status_item: Option<Retained<NSStatusItem>>,
-    menu: Retained<NSMenu>,
-    target: Retained<AnyObject>,
-    handler: Handler,
-    click_policy: TrayClickPolicy,
-}
-
-thread_local! {
-    static TRAY: RefCell<Option<Tray>> = const { RefCell::new(None) };
-}
-
-impl Drop for Tray {
-    fn drop(&mut self) {
-        if let Some(item) = self.status_item.take() {
-            NSStatusBar::systemStatusBar().removeStatusItem(&item);
-        }
-    }
-}
-
-pub fn set_up_tray(cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem) -> Result<()> {
+pub fn set_up_tray(
+    cx: &mut gpui::App,
+    async_app: AsyncApp,
+    initial: TrayState,
+    on_event: TrayEventCallback,
+) -> Result<TrayHandle> {
     with_pool(|| unsafe {
         let mtm = mtm()?;
         let menu = NSMenu::new(mtm);
 
-        let callback = Arc::new(Mutex::new(item.event.take()));
+        let callback = Arc::new(Mutex::new(Some(on_event)));
         let tag_to_id = Arc::new(Mutex::new(HashMap::new()));
         let handler = Handler {
-            async_app,
+            async_app: async_app.clone(),
             callback,
             tag_to_id,
         };
@@ -206,77 +248,182 @@ pub fn set_up_tray(cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem) 
         let ivar = target_class.instance_variable(c"rust_state").unwrap();
         *ivar.load_ptr::<*mut c_void>(&target) = state_ptr;
 
-        TRAY.with(|tray_cell| {
-            let mut tray_slot = tray_cell
+        TRAY_RUNTIME.with(|runtime_cell| {
+            let mut runtime_slot = runtime_cell
                 .try_borrow_mut()
-                .map_err(|_| anyhow::anyhow!("tray storage already borrowed"))?;
-            if tray_slot.is_some() {
+                .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
+            if runtime_slot.is_some() {
                 anyhow::bail!("tray already initialized");
             }
-            *tray_slot = Some(Tray {
-                mtm,
-                status_item: None,
-                menu,
-                target,
-                handler,
-                click_policy: TrayClickPolicy::default(),
+
+            *runtime_slot = Some(TrayRuntime {
+                async_app: async_app.clone(),
+                state: TrayRuntimeState::new(initial),
+                platform: Some(Box::new(TrayPlatform {
+                    mtm,
+                    status_item: None,
+                    menu,
+                    target,
+                    handler,
+                    click_policy: TrayClickPolicy::default(),
+                })),
+                interaction_active: false,
             });
+
             Ok(())
         })?;
 
-        sync_tray(cx, item)
+        let handle = TrayHandle;
+        handle.flush_now(cx)?;
+        Ok(handle)
     })
 }
 
-pub fn sync_tray(_cx: &mut gpui::App, mut item: TrayItem) -> Result<()> {
-    with_pool(|| {
-        TRAY.with(|tray_cell| {
-            let mut tray_slot = tray_cell
-                .try_borrow_mut()
-                .map_err(|_| anyhow::anyhow!("tray storage already borrowed"))?;
-            let tray = tray_slot
-                .as_mut()
-                .context("tray has not been initialized")?;
-
-            if let Some(cb) = item.event.take()
-                && let Ok(mut slot) = tray.handler.callback.lock()
-            {
-                *slot = Some(cb);
-            }
-
-            tray.update(&item)
+fn schedule_flush(async_app: AsyncApp) {
+    let executor = async_app.foreground_executor().clone();
+    executor
+        .spawn(async move {
+            let _ = flush_runtime();
         })
+        .detach();
+}
+
+fn handle_status_item_click() -> Result<()> {
+    let mut platform = TRAY_RUNTIME.with(|runtime_cell| {
+        let mut runtime_slot = runtime_cell
+            .try_borrow_mut()
+            .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
+        let runtime = runtime_slot
+            .as_mut()
+            .context("tray has not been initialized")?;
+        runtime.interaction_active = true;
+        runtime
+            .platform
+            .take()
+            .context("tray platform missing during click")
+    })?;
+
+    let click_result = platform.handle_status_item_click();
+
+    let async_app = TRAY_RUNTIME.with(|runtime_cell| -> Result<Option<AsyncApp>> {
+        let mut runtime_slot = runtime_cell
+            .try_borrow_mut()
+            .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
+        let runtime = runtime_slot
+            .as_mut()
+            .context("tray has not been initialized")?;
+        runtime.platform = Some(platform);
+        runtime.interaction_active = false;
+        Ok(runtime
+            .state
+            .has_pending_flush()
+            .then(|| runtime.async_app.clone()))
+    })?;
+
+    if let Some(async_app) = async_app {
+        schedule_flush(async_app);
+    }
+
+    click_result
+}
+
+fn flush_runtime() -> Result<()> {
+    with_pool(|| {
+        loop {
+            let step = TRAY_RUNTIME.with(
+                |runtime_cell| -> Result<Option<(Box<TrayPlatform>, VersionedTrayState)>> {
+                    let mut runtime_slot = runtime_cell
+                        .try_borrow_mut()
+                        .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
+                    let runtime = runtime_slot
+                        .as_mut()
+                        .context("tray has not been initialized")?;
+
+                    if runtime.interaction_active {
+                        return Ok(None);
+                    }
+
+                    let Some(versioned_state) = runtime.state.try_begin_flush() else {
+                        return Ok(None);
+                    };
+
+                    let platform = runtime
+                        .platform
+                        .take()
+                        .context("tray platform missing during flush")?;
+
+                    Ok(Some((platform, versioned_state)))
+                },
+            )?;
+
+            let Some((mut platform, versioned_state)) = step else {
+                return Ok(());
+            };
+
+            let apply_result = platform.apply(&versioned_state.state);
+
+            let should_continue = TRAY_RUNTIME.with(|runtime_cell| -> Result<bool> {
+                let mut runtime_slot = runtime_cell
+                    .try_borrow_mut()
+                    .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
+                let runtime = runtime_slot
+                    .as_mut()
+                    .context("tray has not been initialized")?;
+                runtime.platform = Some(platform);
+
+                if apply_result.is_ok() {
+                    Ok(runtime.state.finish_flush(versioned_state))
+                } else {
+                    runtime.state.abort_flush();
+                    Ok(false)
+                }
+            })?;
+
+            apply_result?;
+
+            if !should_continue {
+                return Ok(());
+            }
+        }
     })
 }
 
-impl Tray {
-    fn update(&mut self, item: &TrayItem) -> Result<()> {
-        self.set_visible(item.visible)?;
-        if !item.visible {
+impl TrayPlatform {
+    fn status_item_click_context(&self) -> StatusItemClickContext {
+        StatusItemClickContext {
+            handler: self.handler.clone(),
+            click_policy: self.click_policy,
+            status_item: self.status_item.clone(),
+            menu: self.menu.clone(),
+        }
+    }
+
+    fn apply(&mut self, state: &TrayState) -> Result<()> {
+        self.set_visible(state.visible)?;
+        if !state.visible {
             return Ok(());
         }
 
-        self.rebuild_menu(&item.submenus)?;
+        self.rebuild_menu(&state.submenus)?;
 
         let status_item = self.status_item.as_ref().context("status item is nil")?;
-
         let button = status_item
             .button(self.mtm)
             .context("status item button is nil")?;
+
         unsafe { button.setTarget(Some(&self.target)) };
         unsafe { button.setAction(Some(sel!(onStatusItemClick:))) };
         button.sendActionOn(
             NSEventMask::LeftMouseUp | NSEventMask::RightMouseUp | NSEventMask::OtherMouseUp,
         );
 
-        let tooltip = NSString::from_str(item.tooltip.as_str());
+        let tooltip = NSString::from_str(state.tooltip.as_str());
         button.setToolTip(Some(&tooltip));
 
-        let title = NSString::from_str(item.title.as_str());
+        let title = NSString::from_str(state.title.as_str());
         button.setTitle(&title);
 
-        let nsimage = item.icon.as_deref().map(nsimage_from_image).transpose()?;
-
+        let nsimage = state.icon.as_deref().map(nsimage_from_image).transpose()?;
         if let Some(nsimage) = nsimage {
             let new_size = NSSize::new(18., 18.);
             button.setImage(Some(&nsimage));
@@ -287,59 +434,12 @@ impl Tray {
             button.setImage(None);
         }
 
-        self.click_policy = item.click_policy;
-
+        self.click_policy = state.click_policy;
         Ok(())
     }
 
     fn handle_status_item_click(&mut self) -> Result<()> {
-        let app = NSApplication::sharedApplication(self.mtm);
-        let event = app
-            .currentEvent()
-            .context("status item click missing event")?;
-        let mouse_location = NSEvent::mouseLocation();
-        let position = Point {
-            x: mouse_location.x as i32,
-            y: mouse_location.y as i32,
-        };
-
-        let (action, button, kind) = match event.r#type() {
-            NSEventType::RightMouseUp => (
-                self.click_policy.right,
-                MouseButton::Right,
-                TrayClickKind::Single,
-            ),
-            NSEventType::LeftMouseUp if event.clickCount() >= 2 => (
-                self.click_policy.double_click,
-                MouseButton::Left,
-                TrayClickKind::Double,
-            ),
-            NSEventType::LeftMouseUp => (
-                self.click_policy.left,
-                MouseButton::Left,
-                TrayClickKind::Single,
-            ),
-            _ => return Ok(()),
-        };
-
-        match action {
-            TrayClickAction::EmitEvent => {
-                self.handler.dispatch(TrayEvent::TrayClick {
-                    button,
-                    kind,
-                    position,
-                });
-            }
-            TrayClickAction::OpenMenu => {
-                if let Some(status_item) = self.status_item.as_ref() {
-                    #[allow(deprecated)]
-                    status_item.popUpStatusItemMenu(&self.menu);
-                }
-            }
-            TrayClickAction::Ignore => {}
-        }
-
-        Ok(())
+        self.status_item_click_context().handle()
     }
 
     fn set_visible(&mut self, visible: bool) -> Result<()> {
@@ -388,6 +488,58 @@ impl Tray {
     }
 }
 
+impl StatusItemClickContext {
+    fn handle(&self) -> Result<()> {
+        let app = NSApplication::sharedApplication(mtm()?);
+        let event = app
+            .currentEvent()
+            .context("status item click missing event")?;
+        let mouse_location = NSEvent::mouseLocation();
+        let position = Point {
+            x: mouse_location.x as i32,
+            y: mouse_location.y as i32,
+        };
+
+        let (action, button, kind) = match event.r#type() {
+            NSEventType::RightMouseUp => (
+                self.click_policy.right,
+                MouseButton::Right,
+                TrayClickKind::Single,
+            ),
+            NSEventType::LeftMouseUp if event.clickCount() >= 2 => (
+                self.click_policy.double_click,
+                MouseButton::Left,
+                TrayClickKind::Double,
+            ),
+            NSEventType::LeftMouseUp => (
+                self.click_policy.left,
+                MouseButton::Left,
+                TrayClickKind::Single,
+            ),
+            _ => return Ok(()),
+        };
+
+        match action {
+            TrayClickAction::EmitEvent => {
+                self.handler.dispatch(TrayEvent::TrayClick {
+                    button,
+                    kind,
+                    position,
+                });
+            }
+            TrayClickAction::OpenMenu => {
+                if let Some(status_item) = self.status_item.as_ref() {
+                    #[allow(deprecated)]
+                    status_item.popUpStatusItemMenu(&self.menu);
+                }
+            }
+            TrayClickAction::Ignore => {}
+        }
+
+        Ok(())
+    }
+}
+
 fn nsimage_from_image(image: &gpui::Image) -> Result<Retained<NSImage>> {
     let nsdata = unsafe {
         NSData::dataWithBytes_length(image.bytes.as_ptr().cast(), image.bytes.len() as _)
@@ -428,14 +580,12 @@ unsafe fn add_tray_menu_item(
             if children.is_empty() {
                 let title = NSString::from_str(label.as_str());
                 let key_equiv = NSString::from_str("");
-                let menu_item = unsafe {
-                    NSMenuItem::initWithTitle_action_keyEquivalent(
-                        NSMenuItem::alloc(mtm),
-                        &title,
-                        Some(sel!(onMenuItem:)),
-                        &key_equiv,
-                    )
-                };
+                let menu_item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &title,
+                    Some(sel!(onMenuItem:)),
+                    &key_equiv,
+                );
                 if let Some(user_id) = item.menu_event_id() {
                     let tag = *next_tag;
                     *next_tag += 1;
@@ -453,36 +603,25 @@ unsafe fn add_tray_menu_item(
                     Some(TrayToggleType::Radio(checked)) => *checked,
                     None => false,
                 };
-                let state_value = if checked {
+                menu_item.setState(if checked {
                     NSControlStateValueOn
                 } else {
                     NSControlStateValueOff
-                };
-                menu_item.setState(state_value);
+                });
                 menu_item.setEnabled(*enabled);
-
                 menu.addItem(&menu_item);
             } else {
-                let title = NSString::from_str(label.as_str());
-                let key_equiv = NSString::from_str("");
-
-                let submenu_item = unsafe {
-                    NSMenuItem::initWithTitle_action_keyEquivalent(
-                        NSMenuItem::alloc(mtm),
-                        &title,
-                        None,
-                        &key_equiv,
-                    )
-                };
-
                 let submenu = NSMenu::new(mtm);
                 for child in children {
                     add_tray_menu_item(&submenu, child, handler, target, mtm, next_tag)?;
                 }
 
-                submenu_item.setEnabled(*enabled);
-                submenu_item.setSubmenu(Some(&submenu));
-                menu.addItem(&submenu_item);
+                let title = NSString::from_str(label.as_str());
+                let menu_item = NSMenuItem::new(mtm);
+                menu_item.setTitle(&title);
+                menu_item.setEnabled(*enabled);
+                menu_item.setSubmenu(Some(&submenu));
+                menu.addItem(&menu_item);
             }
         }
     }

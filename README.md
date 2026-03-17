@@ -16,14 +16,14 @@ Create and install a tray item:
 ```rust
 use gpui::{App, Application};
 use gpui_tray::{
-    TrayClickAction, TrayClickPolicy, TrayEvent, TrayItem, TrayMenuItem,
+    TrayClickAction, TrayClickPolicy, TrayEvent, TrayMenuItem, TrayState,
 };
 
 fn main() -> anyhow::Result<()> {
     Application::new().run(|cx: &mut App| {
         let async_app = cx.to_async();
 
-        let item = TrayItem::new()
+        let state = TrayState::new()
             .visible(true)
             .icon(gpui::Image::from_bytes(
                 gpui::ImageFormat::Png,
@@ -40,19 +40,28 @@ fn main() -> anyhow::Result<()> {
             .submenu(TrayMenuItem::menu("quit", "Quit", Vec::new()))
             .submenu(
                 TrayMenuItem::menu("syncing", "Applying settings...", Vec::new()).enabled(false),
-            )
-            .on_event(|event, cx| match event {
+            );
+
+        let tray = gpui_tray::tray::set_up_tray(cx, async_app, state, |event, cx| match event {
                 TrayEvent::MenuClick { id } if id == "quit" => cx.quit(),
                 _ => {}
-            });
+            })
+            .ok();
 
-        gpui_tray::tray::set_up_tray(cx, async_app, item).ok();
+        if let Some(tray) = tray {
+            let updated = TrayState::new()
+                .visible(true)
+                .title("My App (syncing)")
+                .tooltip("Refreshing tray state");
+            let _ = tray.set_state(updated);
+            let _ = tray.flush_now(cx);
+        }
     });
     Ok(())
 }
 ```
 
-Update the tray later by calling `gpui_tray::tray::sync_tray(cx, item)` with a new `TrayItem`.
+Update the tray later by calling `tray.set_state(new_state)`, and call `tray.flush_now(cx)` when you want to eagerly push the latest desired state to the native tray.
 
 ### Menu Item Capabilities
 

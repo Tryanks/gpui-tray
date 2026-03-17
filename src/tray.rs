@@ -226,7 +226,8 @@ pub enum TrayEvent {
     },
 }
 
-pub struct TrayItem {
+#[derive(Clone)]
+pub struct TrayState {
     pub(crate) visible: bool,
     pub(crate) icon: Option<Rc<Image>>,
     pub(crate) title: String,
@@ -234,10 +235,9 @@ pub struct TrayItem {
     pub(crate) description: String,
     pub(crate) submenus: Vec<TrayMenuItem>,
     pub(crate) click_policy: TrayClickPolicy,
-    pub(crate) event: Option<TrayEventCallback>,
 }
 
-impl TrayItem {
+impl TrayState {
     pub fn new() -> Self {
         Self {
             visible: true,
@@ -247,7 +247,6 @@ impl TrayItem {
             description: String::new(),
             submenus: Vec::new(),
             click_policy: TrayClickPolicy::default(),
-            event: None,
         }
     }
 
@@ -285,16 +284,88 @@ impl TrayItem {
         self.click_policy = click_policy;
         self
     }
+}
 
-    pub fn on_event(mut self, event: impl FnMut(TrayEvent, &mut App) + Send + 'static) -> Self {
-        self.event = Some(Box::new(event));
-        self
+impl Default for TrayState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl Default for TrayItem {
-    fn default() -> Self {
-        Self::new()
+#[derive(Clone)]
+pub(crate) struct VersionedTrayState {
+    pub(crate) version: u64,
+    pub(crate) state: TrayState,
+}
+
+#[derive(Clone)]
+pub(crate) struct TrayRuntimeState {
+    pub(crate) desired_state: Option<VersionedTrayState>,
+    pub(crate) applied_state: Option<VersionedTrayState>,
+    pub(crate) flush_scheduled: bool,
+    pub(crate) flushing: bool,
+    next_version: u64,
+}
+
+impl TrayRuntimeState {
+    pub(crate) fn new(initial: TrayState) -> Self {
+        let mut runtime = Self {
+            desired_state: None,
+            applied_state: None,
+            flush_scheduled: false,
+            flushing: false,
+            next_version: 1,
+        };
+        let _ = runtime.set_desired_state(initial);
+        runtime
+    }
+
+    pub(crate) fn set_desired_state(&mut self, state: TrayState) -> bool {
+        let version = self.next_version;
+        self.next_version = self.next_version.saturating_add(1);
+        self.desired_state = Some(VersionedTrayState { version, state });
+        self.request_flush()
+    }
+
+    pub(crate) fn request_flush(&mut self) -> bool {
+        if self.flush_scheduled {
+            return false;
+        }
+        self.flush_scheduled = true;
+        true
+    }
+
+    pub(crate) fn try_begin_flush(&mut self) -> Option<VersionedTrayState> {
+        if self.flushing || !self.flush_scheduled {
+            return None;
+        }
+        let desired = self.desired_state.clone()?;
+        self.flushing = true;
+        self.flush_scheduled = false;
+        Some(desired)
+    }
+
+    pub(crate) fn finish_flush(&mut self, applied_state: VersionedTrayState) -> bool {
+        self.applied_state = Some(applied_state.clone());
+        self.flushing = false;
+
+        if self.flush_scheduled {
+            return true;
+        }
+
+        self.desired_state
+            .as_ref()
+            .map(|desired| desired.version != applied_state.version)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn abort_flush(&mut self) {
+        self.flushing = false;
+        self.flush_scheduled = true;
+    }
+
+    pub(crate) fn has_pending_flush(&self) -> bool {
+        self.flush_scheduled
     }
 }
 
@@ -308,41 +379,106 @@ mod tray_windows;
 mod tray_linux;
 
 #[cfg(target_os = "macos")]
-pub fn set_up_tray(cx: &mut App, async_app: AsyncApp, item: TrayItem) -> anyhow::Result<()> {
-    tray_macos::set_up_tray(cx, async_app, item)
-}
+pub use tray_macos::TrayHandle;
 
 #[cfg(windows)]
-pub fn set_up_tray(cx: &mut App, async_app: AsyncApp, item: TrayItem) -> anyhow::Result<()> {
-    tray_windows::set_up_tray(cx, async_app, item)
-}
+pub use tray_windows::TrayHandle;
 
 #[cfg(target_os = "linux")]
-pub fn set_up_tray(cx: &mut App, async_app: AsyncApp, item: TrayItem) -> anyhow::Result<()> {
-    tray_linux::set_up_tray(cx, async_app, item)
-}
+pub use tray_linux::TrayHandle;
 
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
-pub fn set_up_tray(_cx: &mut App, _async_app: AsyncApp, _item: TrayItem) -> anyhow::Result<()> {
-    Ok(())
-}
+#[derive(Clone, Default)]
+pub struct TrayHandle;
 
 #[cfg(target_os = "macos")]
-pub fn sync_tray(cx: &mut App, item: TrayItem) -> anyhow::Result<()> {
-    tray_macos::sync_tray(cx, item)
+pub fn set_up_tray(
+    cx: &mut App,
+    async_app: AsyncApp,
+    initial: TrayState,
+    on_event: impl FnMut(TrayEvent, &mut App) + Send + 'static,
+) -> anyhow::Result<TrayHandle> {
+    tray_macos::set_up_tray(cx, async_app, initial, Box::new(on_event))
 }
 
 #[cfg(windows)]
-pub fn sync_tray(cx: &mut App, item: TrayItem) -> anyhow::Result<()> {
-    tray_windows::sync_tray(cx, item)
+pub fn set_up_tray(
+    cx: &mut App,
+    async_app: AsyncApp,
+    initial: TrayState,
+    on_event: impl FnMut(TrayEvent, &mut App) + Send + 'static,
+) -> anyhow::Result<TrayHandle> {
+    tray_windows::set_up_tray(cx, async_app, initial, Box::new(on_event))
 }
 
 #[cfg(target_os = "linux")]
-pub fn sync_tray(cx: &mut App, item: TrayItem) -> anyhow::Result<()> {
-    tray_linux::sync_tray(cx, item)
+pub fn set_up_tray(
+    cx: &mut App,
+    async_app: AsyncApp,
+    initial: TrayState,
+    on_event: impl FnMut(TrayEvent, &mut App) + Send + 'static,
+) -> anyhow::Result<TrayHandle> {
+    tray_linux::set_up_tray(cx, async_app, initial, Box::new(on_event))
 }
 
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
-pub fn sync_tray(_cx: &mut App, _item: TrayItem) -> anyhow::Result<()> {
-    Ok(())
+pub fn set_up_tray(
+    _cx: &mut App,
+    _async_app: AsyncApp,
+    _initial: TrayState,
+    _on_event: impl FnMut(TrayEvent, &mut App) + Send + 'static,
+) -> anyhow::Result<TrayHandle> {
+    Ok(TrayHandle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TrayRuntimeState, TrayState};
+
+    #[test]
+    fn tray_state_clones_builder_data() {
+        let state = TrayState::new()
+            .title("hello")
+            .tooltip("tip")
+            .visible(false);
+        let cloned = state.clone();
+
+        assert!(!cloned.visible);
+        assert_eq!(cloned.title, "hello");
+        assert_eq!(cloned.tooltip, "tip");
+    }
+
+    #[test]
+    fn latest_state_wins_after_multiple_updates() {
+        let mut runtime = TrayRuntimeState::new(TrayState::new().title("A"));
+        let _ = runtime.set_desired_state(TrayState::new().title("B"));
+        let flushing = runtime.try_begin_flush().expect("pending flush");
+
+        assert_eq!(flushing.state.title, "B");
+        assert!(!runtime.flush_scheduled);
+        assert!(runtime.flushing);
+    }
+
+    #[test]
+    fn state_changes_during_flush_schedule_follow_up() {
+        let mut runtime = TrayRuntimeState::new(TrayState::new().title("A"));
+        let flushing = runtime.try_begin_flush().expect("pending flush");
+        let _ = runtime.set_desired_state(TrayState::new().title("B"));
+
+        assert!(runtime.finish_flush(flushing));
+
+        let follow_up = runtime.try_begin_flush().expect("follow-up flush");
+        assert_eq!(follow_up.state.title, "B");
+    }
+
+    #[test]
+    fn aborting_flush_requeues_work() {
+        let mut runtime = TrayRuntimeState::new(TrayState::new().title("A"));
+        let _ = runtime.try_begin_flush().expect("pending flush");
+
+        runtime.abort_flush();
+
+        assert!(runtime.has_pending_flush());
+        assert!(!runtime.flushing);
+    }
 }

@@ -1,6 +1,7 @@
 use crate::tray::{
-    TrayClickAction, TrayClickKind, TrayClickPolicy, TrayEvent, TrayEventCallbackSlot, TrayItem,
-    TrayMenuItem, TrayToggleType,
+    TrayClickAction, TrayClickKind, TrayClickPolicy, TrayEvent, TrayEventCallback,
+    TrayEventCallbackSlot, TrayMenuItem, TrayRuntimeState, TrayState, TrayToggleType,
+    VersionedTrayState,
 };
 use anyhow::{Context as _, Result};
 use gpui::{AsyncApp, MouseButton, Point};
@@ -32,12 +33,40 @@ use windows_sys::Win32::{
             MF_DISABLED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW,
             PostQuitMessage, RegisterClassW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
             TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE,
-            WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NULL, WM_RBUTTONDOWN,
-            WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_USER, WNDCLASSW,
+            WS_OVERLAPPEDWINDOW,
         },
     },
 };
 use windows_sys::core::BOOL;
+
+#[derive(Clone, Default)]
+pub struct TrayHandle;
+
+impl TrayHandle {
+    pub fn set_state(&self, state: TrayState) -> Result<()> {
+        let async_app = TRAY_RUNTIME.with(|runtime_cell| -> Result<Option<AsyncApp>> {
+            let mut runtime_slot = runtime_cell
+                .try_borrow_mut()
+                .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
+            let runtime = runtime_slot
+                .as_mut()
+                .context("tray has not been initialized")?;
+            let should_schedule = runtime.state.set_desired_state(state);
+            Ok(should_schedule.then(|| runtime.async_app.clone()))
+        })?;
+
+        if let Some(async_app) = async_app {
+            schedule_flush(async_app);
+        }
+
+        Ok(())
+    }
+
+    pub fn flush_now(&self, _cx: &mut gpui::App) -> Result<()> {
+        flush_runtime()
+    }
+}
 
 // Tray callback must be in WM_USER..0x7FFF per Shell_NotifyIconW requirements.
 const TRAY_CALLBACK_MESSAGE: u32 = WM_USER + 1;
@@ -57,15 +86,18 @@ impl Handler {
     fn dispatch(&self, event: TrayEvent) {
         let async_app = self.async_app.clone();
         let callback = self.callback.clone();
-        async_app.update(|cx| {
-            cx.defer(move |cx| {
-                if let Ok(mut slot) = callback.lock()
-                    && let Some(cb) = slot.as_mut()
-                {
-                    cb(event, cx);
-                }
-            });
-        });
+        async_app
+            .foreground_executor()
+            .spawn(async move {
+                async_app.update(|cx| {
+                    if let Ok(mut slot) = callback.lock()
+                        && let Some(cb) = slot.as_mut()
+                    {
+                        cb(event, cx);
+                    }
+                });
+            })
+            .detach();
     }
 
     fn dispatch_command(&self, cmd: u16) {
@@ -73,14 +105,14 @@ impl Handler {
             .id_to_menu_id
             .lock()
             .ok()
-            .and_then(|m| m.get(&cmd).cloned());
+            .and_then(|map| map.get(&cmd).cloned());
         if let Some(id) = id {
             self.dispatch(TrayEvent::MenuClick { id });
         }
     }
 }
 
-struct Tray {
+struct TrayPlatform {
     handler: Handler,
     hwnd: HWND,
     menu: HMENU,
@@ -90,7 +122,14 @@ struct Tray {
     hicon_owned: bool,
 }
 
-impl Drop for Tray {
+struct TrayRuntime {
+    async_app: AsyncApp,
+    state: TrayRuntimeState,
+    platform: Option<Box<TrayPlatform>>,
+    interaction_active: bool,
+}
+
+impl Drop for TrayPlatform {
     fn drop(&mut self) {
         unsafe {
             let _ = self.delete_icon();
@@ -110,7 +149,7 @@ impl Drop for Tray {
 }
 
 thread_local! {
-    static TRAY: RefCell<Option<Box<Tray>>> = const { RefCell::new(None) };
+    static TRAY_RUNTIME: RefCell<Option<TrayRuntime>> = const { RefCell::new(None) };
 }
 
 fn to_wide_null(text: impl AsRef<OsStr>) -> Vec<u16> {
@@ -123,11 +162,11 @@ fn class_name() -> &'static [u16] {
         .as_slice()
 }
 
-unsafe fn tray_from_window(hwnd: HWND) -> Option<&'static mut Tray> {
+unsafe fn tray_from_window(hwnd: HWND) -> Option<&'static mut TrayPlatform> {
     let state_ptr = windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
         hwnd,
         windows_sys::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
-    ) as *mut Tray;
+    ) as *mut TrayPlatform;
     state_ptr.as_mut()
 }
 
@@ -161,19 +200,14 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_TRAY_OPEN_MENU => {
-            let Some(tray) = tray_from_window(hwnd) else {
-                return 0;
-            };
-            tray.handle_click(wparam);
+            let _ = handle_tray_click(wparam);
             0
         }
         WM_COMMAND => {
-            let Some(tray) = tray_from_window(hwnd) else {
-                return 0;
-            };
-
-            let id = (wparam & 0xffff) as u16;
-            tray.handler.dispatch_command(id);
+            if let Some(tray) = tray_from_window(hwnd) {
+                let id = (wparam & 0xffff) as u16;
+                tray.handler.dispatch_command(id);
+            }
             0
         }
         WM_DESTROY => {
@@ -213,8 +247,194 @@ fn register_window_class(instance: HMODULE) -> Result<()> {
     Ok(())
 }
 
-impl Tray {
-    unsafe fn handle_click(&self, click_code: usize) {
+pub fn set_up_tray(
+    cx: &mut gpui::App,
+    async_app: AsyncApp,
+    initial: TrayState,
+    on_event: TrayEventCallback,
+) -> Result<TrayHandle> {
+    let instance = unsafe { GetModuleHandleW(ptr::null()) };
+    (instance != ptr::null_mut())
+        .then_some(())
+        .context("GetModuleHandleW failed")?;
+
+    register_window_class(instance)?;
+
+    let callback = Arc::new(Mutex::new(Some(on_event)));
+    let id_to_menu_id = Arc::new(Mutex::new(HashMap::new()));
+    let handler = Handler {
+        async_app: async_app.clone(),
+        callback,
+        id_to_menu_id,
+    };
+
+    let menu = unsafe { CreatePopupMenu() };
+    (menu != ptr::null_mut())
+        .then_some(())
+        .context("CreatePopupMenu failed")?;
+
+    let mut platform = Box::new(TrayPlatform {
+        handler,
+        hwnd: ptr::null_mut(),
+        menu,
+        click_policy: TrayClickPolicy::default(),
+        icon_added: false,
+        hicon: ptr::null_mut(),
+        hicon_owned: false,
+    });
+
+    unsafe {
+        let hwnd = CreateWindowExW(
+            0,
+            class_name().as_ptr(),
+            class_name().as_ptr(),
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            instance,
+            platform.as_mut() as *mut TrayPlatform as *const _,
+        );
+        (hwnd != ptr::null_mut())
+            .then_some(())
+            .context("CreateWindowExW failed")?;
+        platform.hwnd = hwnd;
+    }
+
+    TRAY_RUNTIME.with(|runtime_cell| {
+        let mut runtime_slot = runtime_cell
+            .try_borrow_mut()
+            .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
+        if runtime_slot.is_some() {
+            anyhow::bail!("tray already initialized");
+        }
+
+        *runtime_slot = Some(TrayRuntime {
+            async_app: async_app.clone(),
+            state: TrayRuntimeState::new(initial),
+            platform: Some(platform),
+            interaction_active: false,
+        });
+        Ok(())
+    })?;
+
+    let handle = TrayHandle;
+    handle.flush_now(cx)?;
+    Ok(handle)
+}
+
+fn schedule_flush(async_app: AsyncApp) {
+    async_app
+        .foreground_executor()
+        .spawn(async move {
+            let _ = flush_runtime();
+        })
+        .detach();
+}
+
+fn handle_tray_click(click_code: usize) -> Result<()> {
+    let mut platform = TRAY_RUNTIME.with(|runtime_cell| {
+        let mut runtime_slot = runtime_cell
+            .try_borrow_mut()
+            .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
+        let runtime = runtime_slot
+            .as_mut()
+            .context("tray has not been initialized")?;
+        runtime.interaction_active = true;
+        runtime
+            .platform
+            .take()
+            .context("tray platform missing during click")
+    })?;
+
+    let click_result = unsafe { platform.handle_click(click_code) };
+
+    let async_app = TRAY_RUNTIME.with(|runtime_cell| -> Result<Option<AsyncApp>> {
+        let mut runtime_slot = runtime_cell
+            .try_borrow_mut()
+            .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
+        let runtime = runtime_slot
+            .as_mut()
+            .context("tray has not been initialized")?;
+        runtime.platform = Some(platform);
+        runtime.interaction_active = false;
+        Ok(runtime
+            .state
+            .has_pending_flush()
+            .then(|| runtime.async_app.clone()))
+    })?;
+
+    if let Some(async_app) = async_app {
+        schedule_flush(async_app);
+    }
+
+    click_result
+}
+
+fn flush_runtime() -> Result<()> {
+    loop {
+        let step = TRAY_RUNTIME.with(
+            |runtime_cell| -> Result<Option<(Box<TrayPlatform>, VersionedTrayState)>> {
+                let mut runtime_slot = runtime_cell
+                    .try_borrow_mut()
+                    .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
+                let runtime = runtime_slot
+                    .as_mut()
+                    .context("tray has not been initialized")?;
+
+                if runtime.interaction_active {
+                    return Ok(None);
+                }
+
+                let Some(versioned_state) = runtime.state.try_begin_flush() else {
+                    return Ok(None);
+                };
+
+                let platform = runtime
+                    .platform
+                    .take()
+                    .context("tray platform missing during flush")?;
+
+                Ok(Some((platform, versioned_state)))
+            },
+        )?;
+
+        let Some((mut platform, versioned_state)) = step else {
+            return Ok(());
+        };
+
+        let apply_result = unsafe { platform.apply(&versioned_state.state) };
+
+        let should_continue = TRAY_RUNTIME.with(|runtime_cell| -> Result<bool> {
+            let mut runtime_slot = runtime_cell
+                .try_borrow_mut()
+                .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
+            let runtime = runtime_slot
+                .as_mut()
+                .context("tray has not been initialized")?;
+            runtime.platform = Some(platform);
+
+            if apply_result.is_ok() {
+                Ok(runtime.state.finish_flush(versioned_state))
+            } else {
+                runtime.state.abort_flush();
+                Ok(false)
+            }
+        })?;
+
+        apply_result?;
+
+        if !should_continue {
+            return Ok(());
+        }
+    }
+}
+
+impl TrayPlatform {
+    unsafe fn handle_click(&self, click_code: usize) -> Result<()> {
         let mut point = WIN_POINT { x: 0, y: 0 };
         let _ = GetCursorPos(&mut point);
 
@@ -234,7 +454,7 @@ impl Tray {
                 MouseButton::Left,
                 TrayClickKind::Double,
             ),
-            _ => return,
+            _ => return Ok(()),
         };
 
         match action {
@@ -267,9 +487,11 @@ impl Tray {
             }
             TrayClickAction::Ignore => {}
         }
+
+        Ok(())
     }
 
-    unsafe fn notify_data(&self, item: &TrayItem) -> NOTIFYICONDATAW {
+    unsafe fn notify_data(&self, tooltip: &str) -> NOTIFYICONDATAW {
         let mut data: NOTIFYICONDATAW = mem::zeroed();
         data.cbSize = mem::size_of::<NOTIFYICONDATAW>() as u32;
         data.hWnd = self.hwnd;
@@ -283,7 +505,7 @@ impl Tray {
             LoadIconW(ptr::null_mut(), IDI_APPLICATION)
         };
 
-        let tooltip_wide = to_wide_null(item.tooltip.as_str());
+        let tooltip_wide = to_wide_null(tooltip);
         let copy_len = (tooltip_wide.len().saturating_sub(1)).min(data.szTip.len() - 1);
         data.szTip[..copy_len].copy_from_slice(&tooltip_wide[..copy_len]);
         data.szTip[copy_len] = 0;
@@ -291,22 +513,19 @@ impl Tray {
         data
     }
 
-    unsafe fn add_icon(&mut self, item: &TrayItem) -> Result<()> {
+    unsafe fn add_icon(&mut self, state: &TrayState) -> Result<()> {
         if self.icon_added {
             return Ok(());
         }
 
-        let data = self.notify_data(item);
+        let data = self.notify_data(state.tooltip.as_str());
         let ok = Shell_NotifyIconW(NIM_ADD, &data);
         (ok != 0)
             .then_some(())
             .context("Shell_NotifyIconW(NIM_ADD) failed")?;
 
         let mut data_version = data;
-        // `uVersion` lives in an anonymous union in windows-sys 0.48
-        unsafe {
-            data_version.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-        }
+        data_version.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         let _ = Shell_NotifyIconW(NIM_SETVERSION, &data_version);
 
         self.icon_added = true;
@@ -318,9 +537,7 @@ impl Tray {
             return Ok(());
         }
 
-        let mut dummy = TrayItem::new();
-        dummy.tooltip = String::new();
-        let data = self.notify_data(&dummy);
+        let data = self.notify_data("");
         let ok = Shell_NotifyIconW(NIM_DELETE, &data);
         (ok != 0)
             .then_some(())
@@ -330,12 +547,12 @@ impl Tray {
         Ok(())
     }
 
-    unsafe fn modify_icon(&mut self, item: &TrayItem) -> Result<()> {
+    unsafe fn modify_icon(&mut self, state: &TrayState) -> Result<()> {
         if !self.icon_added {
             return Ok(());
         }
 
-        let data = self.notify_data(item);
+        let data = self.notify_data(state.tooltip.as_str());
         let ok = Shell_NotifyIconW(NIM_MODIFY, &data);
         (ok != 0)
             .then_some(())
@@ -389,21 +606,14 @@ impl Tray {
         Ok(())
     }
 
-    unsafe fn sync(&mut self, item: TrayItem) -> Result<()> {
-        let mut item = item;
-        if let Some(cb) = item.event.take() {
-            if let Ok(mut slot) = self.handler.callback.lock() {
-                *slot = Some(cb);
-            }
-        }
-        self.click_policy = item.click_policy;
+    unsafe fn apply(&mut self, state: &TrayState) -> Result<()> {
+        self.click_policy = state.click_policy;
+        self.rebuild_menu(&state.submenus)?;
 
-        self.rebuild_menu(&item.submenus)?;
-
-        if item.visible {
-            self.set_icon(item.icon.as_deref())?;
-            self.add_icon(&item)?;
-            self.modify_icon(&item)?;
+        if state.visible {
+            self.set_icon(state.icon.as_deref())?;
+            self.add_icon(state)?;
+            self.modify_icon(state)?;
         } else {
             self.delete_icon()?;
         }
@@ -431,7 +641,6 @@ unsafe fn hicon_from_bgra32(width: u32, height: u32, bgra: &[u8]) -> Result<HICO
     bmi.bmiHeader = BITMAPINFOHEADER {
         biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
         biWidth: width as i32,
-        // Negative height = top-down, so we don't need to flip rows.
         biHeight: -(height as i32),
         biPlanes: 1,
         biBitCount: 32,
@@ -459,8 +668,7 @@ unsafe fn hicon_from_bgra32(width: u32, height: u32, bgra: &[u8]) -> Result<HICO
     );
     ptr::copy_nonoverlapping(bgra.as_ptr(), bits_ptr.cast::<u8>(), bgra.len());
 
-    // 1bpp mask bitmap must be initialized to 0 (opaque). Row is padded to 32 bits.
-    let mask_stride = ((w + 31) / 32) * 4;
+    let mask_stride = w.div_ceil(32) * 4;
     let mask_bytes = vec![0u8; mask_stride * h];
     let mask_bmp = CreateBitmap(
         width as i32,
@@ -479,7 +687,6 @@ unsafe fn hicon_from_bgra32(width: u32, height: u32, bgra: &[u8]) -> Result<HICO
     ii.hbmMask = mask_bmp;
 
     let hicon = CreateIconIndirect(&ii);
-    // The icon copies the bitmaps; we can delete them afterwards.
     let _ = DeleteObject(color_bmp);
     let _ = DeleteObject(mask_bmp);
 
@@ -521,8 +728,8 @@ unsafe fn append_tray_menu_item(
                 let label_w = to_wide_null(label);
                 let mut flags = MF_STRING;
                 let checked = match toggle_type {
-                    Some(TrayToggleType::Checkbox(b)) => *b,
-                    Some(TrayToggleType::Radio(b)) => *b,
+                    Some(TrayToggleType::Checkbox(checked)) => *checked,
+                    Some(TrayToggleType::Radio(checked)) => *checked,
                     None => false,
                 };
                 flags |= if checked { MF_CHECKED } else { MF_UNCHECKED };
@@ -569,83 +776,4 @@ unsafe fn append_tray_menu_item(
     }
 
     Ok(())
-}
-
-pub fn set_up_tray(cx: &mut gpui::App, async_app: AsyncApp, mut item: TrayItem) -> Result<()> {
-    let instance = unsafe { GetModuleHandleW(ptr::null()) };
-    (instance != ptr::null_mut())
-        .then_some(())
-        .context("GetModuleHandleW failed")?;
-
-    register_window_class(instance)?;
-
-    TRAY.with(|tray_cell| {
-        let mut tray_slot = tray_cell
-            .try_borrow_mut()
-            .map_err(|_| anyhow::anyhow!("tray storage already borrowed"))?;
-        if tray_slot.is_some() {
-            anyhow::bail!("tray already initialized");
-        }
-
-        let callback = Arc::new(Mutex::new(item.event.take()));
-        let id_to_menu_id = Arc::new(Mutex::new(HashMap::new()));
-        let handler = Handler {
-            async_app,
-            callback,
-            id_to_menu_id,
-        };
-
-        let menu = unsafe { CreatePopupMenu() };
-        (menu != ptr::null_mut())
-            .then_some(())
-            .context("CreatePopupMenu failed")?;
-
-        let mut tray = Box::new(Tray {
-            handler,
-            hwnd: ptr::null_mut(),
-            menu,
-            click_policy: TrayClickPolicy::default(),
-            icon_added: false,
-            hicon: ptr::null_mut(),
-            hicon_owned: false,
-        });
-
-        unsafe {
-            let hwnd = CreateWindowExW(
-                0,
-                class_name().as_ptr(),
-                class_name().as_ptr(),
-                WS_OVERLAPPEDWINDOW,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                instance,
-                tray.as_mut() as *mut Tray as *const _,
-            );
-            (hwnd != ptr::null_mut())
-                .then_some(())
-                .context("CreateWindowExW failed")?;
-            tray.hwnd = hwnd;
-        }
-
-        *tray_slot = Some(tray);
-        Ok(())
-    })?;
-
-    sync_tray(cx, item)
-}
-
-pub fn sync_tray(cx: &mut gpui::App, item: TrayItem) -> Result<()> {
-    TRAY.with(|tray_cell| {
-        let mut tray_slot = tray_cell
-            .try_borrow_mut()
-            .map_err(|_| anyhow::anyhow!("tray storage already borrowed"))?;
-        let tray = tray_slot
-            .as_mut()
-            .context("tray has not been initialized")?;
-        unsafe { tray.sync(item) }
-    })
 }

@@ -2,7 +2,7 @@ use gpui::{
     App, Context, Div, Global, Menu, MenuItem, QuitMode, SharedString, Stateful, Window,
     WindowOptions, actions, div, prelude::*,
 };
-use gpui_tray::{TrayEvent, TrayItem, TrayMenuItem};
+use gpui_tray::{TrayEvent, TrayHandle, TrayMenuItem, TrayState};
 
 #[derive(PartialEq)]
 enum ViewMode {
@@ -41,6 +41,7 @@ struct AppState {
     tray_visible: bool,
     tray_title: SharedString,
     tray_tooltip: SharedString,
+    tray_handle: Option<TrayHandle>,
 }
 
 impl AppState {
@@ -50,6 +51,7 @@ impl AppState {
             tray_visible: true,
             tray_title: "Tray App".into(),
             tray_tooltip: "This is a tray icon".into(),
+            tray_handle: None,
         }
     }
 }
@@ -109,11 +111,11 @@ impl Render for Example {
     }
 }
 
-fn build_tray_item(app_state: &AppState) -> TrayItem {
+fn build_tray_state(app_state: &AppState) -> TrayState {
     let list_checked = app_state.view_mode == ViewMode::List;
     let grid_checked = app_state.view_mode == ViewMode::Grid;
 
-    TrayItem::new()
+    TrayState::new()
         .visible(app_state.tray_visible)
         .icon(gpui::Image::from_bytes(
             gpui::ImageFormat::Png,
@@ -157,10 +159,18 @@ fn build_tray_item(app_state: &AppState) -> TrayItem {
         .submenu(TrayMenuItem::menu("Quit", "Quit", Vec::new()))
 }
 
-fn sync_tray(cx: &mut App) {
-    let item = build_tray_item(cx.global::<AppState>());
-    if let Err(error) = gpui_tray::tray::sync_tray(cx, item) {
+fn refresh_tray(cx: &mut App) {
+    let app_state = cx.global::<AppState>();
+    let Some(handle) = app_state.tray_handle.clone() else {
+        return;
+    };
+    let state = build_tray_state(app_state);
+    if let Err(error) = handle.set_state(state) {
         eprintln!("failed to sync tray: {error:#}");
+        return;
+    }
+    if let Err(error) = handle.flush_now(cx) {
+        eprintln!("failed to flush tray: {error:#}");
     }
 }
 
@@ -202,9 +212,14 @@ fn main() -> anyhow::Result<()> {
             }
 
             let async_app = cx.to_async();
-            let item = build_tray_item(cx.global::<AppState>()).on_event(on_tray_event);
-            if let Err(error) = gpui_tray::tray::set_up_tray(cx, async_app, item) {
-                eprintln!("failed to set up tray: {error:#}");
+            let state = build_tray_state(cx.global::<AppState>());
+            match gpui_tray::tray::set_up_tray(cx, async_app, state, on_tray_event) {
+                Ok(handle) => {
+                    cx.global_mut::<AppState>().tray_handle = Some(handle);
+                }
+                Err(error) => {
+                    eprintln!("failed to set up tray: {error:#}");
+                }
             }
         });
 
@@ -255,7 +270,7 @@ fn toggle_check(_: &ToggleCheck, cx: &mut App) {
             format!("This is a tooltip, mode: {}", app_state.view_mode.as_str()).into();
     }
 
-    sync_tray(cx);
+    refresh_tray(cx);
     cx.refresh_windows();
 }
 
@@ -265,7 +280,7 @@ fn toggle_visible(_: &ToggleVisible, cx: &mut App) {
         app_state.tray_visible = !app_state.tray_visible;
     }
 
-    sync_tray(cx);
+    refresh_tray(cx);
     cx.refresh_windows();
 }
 

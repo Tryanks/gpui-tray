@@ -3,6 +3,6 @@ mod icon;
 pub mod tray;
 
 pub use tray::{
-    TrayClickAction, TrayClickKind, TrayClickPolicy, TrayEvent, TrayItem, TrayMenuItem,
-    TrayMenuItemRole, TrayToggleType,
+    TrayClickAction, TrayClickKind, TrayClickPolicy, TrayEvent, TrayHandle, TrayMenuItem,
+    TrayMenuItemRole, TrayState, TrayToggleType,
 };
