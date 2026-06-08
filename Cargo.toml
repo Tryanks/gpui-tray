@@ -1,6 +1,6 @@
 [package]
 name = "gpui-tray"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -9,9 +9,9 @@ gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0"
-objc2-foundation = { version = "0", features = ["NSData", "NSGeometry", "NSString"] }
-objc2-app-kit = { version = "0", features = [
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSData", "NSGeometry", "NSString"] }
+objc2-app-kit = { version = "0.3", features = [
   "NSApplication",
   "NSButton",
   "NSCell",
