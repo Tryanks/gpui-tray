@@ -197,6 +197,7 @@ fn main() -> anyhow::Result<()> {
             cx.set_menus(vec![Menu {
                 name: "tray_demo".into(),
                 items: vec![MenuItem::action("Quit", Quit)],
+                disabled: false,
             }]);
 
             cx.activate(true);
@@ -206,7 +207,7 @@ fn main() -> anyhow::Result<()> {
             cx.on_action(hide_window);
             cx.on_action(show_window);
 
-            cx.on_window_closed(|cx| {
+            cx.on_window_closed(|cx, _window_id| {
                 if cx.windows().is_empty() {
                     #[cfg(target_os = "macos")]
                     {
